@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>一级火箭回收着陆仿真 3D</title>
+<style>
+:root {
+  --glass: rgba(9, 14, 22, 0.78);
+  --glass2: rgba(14, 22, 34, 0.86);
+  --edge: rgba(120, 170, 210, 0.28);
+  --edge-hi: rgba(140, 210, 255, 0.55);
+  --txt: #d8e6f2;
+  --dim: #7f93a6;
+  --cyan: #46d6ff;
+  --green: #5dff9a;
+  --amber: #ffb43c;
+  --red: #ff5a4e;
+  --mag: #ff5ef0;
+  --lox: #7fd3ff;
+  --rp1: #ffcf6a;
+  --mono: "JetBrains Mono", "Cascadia Mono", Consolas, "SFMono-Regular", Menlo, "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: #04070c; color: var(--txt); font-family: var(--mono); overflow: hidden; user-select: none; }
+#view { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+.panel {
+  position: fixed; background: var(--glass); border: 1px solid var(--edge); border-radius: 6px;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.05);
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  padding: 8px 10px; font-size: 11.5px; line-height: 1.35;
+}
+.panel h3 {
+  margin: -8px -10px 7px; padding: 4px 10px; font-size: 10.5px; letter-spacing: 0.14em; font-weight: 600;
+  color: var(--dim); border-bottom: 1px solid var(--edge); background: rgba(255,255,255,0.025);
+  display: flex; justify-content: space-between; align-items: center;
+}
+.panel h3 .tag { color: var(--cyan); letter-spacing: 0.06em; }
+.panel h3, .grip { cursor: grab; }
+.panel.dragging { opacity: 0.85; box-shadow: 0 10px 34px rgba(0,0,0,0.6), 0 0 0 1px var(--edge-hi); }
+.grip { position: absolute; left: 50%; top: 2px; transform: translateX(-50%); width: 46px; height: 12px; border-radius: 6px;
+  background: repeating-linear-gradient(90deg, rgba(160,200,230,0.45) 0 2px, transparent 2px 5px); opacity: 0.6; }
+.grip:hover { opacity: 1; }
+.row { display: flex; justify-content: space-between; gap: 10px; }
+.row .k { color: var(--dim); }
+.row .v { color: var(--txt); font-variant-numeric: tabular-nums; }
+.v.g { color: var(--green); } .v.a { color: var(--amber); } .v.r { color: var(--red); } .v.c { color: var(--cyan); }
+
+/* top strip */
+#top { left: 50%; transform: translateX(-50%); top: 10px; display: flex; gap: 18px; align-items: center; padding: 6px 16px; }
+#top .big { font-size: 26px; font-weight: 600; letter-spacing: 0.02em; color: #fff; font-variant-numeric: tabular-nums; }
+#top .unit { font-size: 11px; color: var(--dim); margin-left: 3px; }
+#top .cell { display: flex; flex-direction: column; align-items: center; min-width: 88px; }
+#top .lbl { font-size: 10.5px; color: var(--dim); letter-spacing: 0.16em; }
+#top .mid { font-size: 16px; font-variant-numeric: tabular-nums; }
+#phaseBadge { padding: 3px 10px; border-radius: 3px; font-weight: 700; letter-spacing: 0.12em; font-size: 12px; border: 1px solid; }
+
+/* autopilot */
+#ap { left: 10px; top: 10px; width: 250px; }
+.ladder { display: flex; flex-direction: column; gap: 3px; margin: 2px 0 6px; }
+.step { display: flex; align-items: center; gap: 8px; padding: 3px 6px; border-radius: 3px; border: 1px solid rgba(255,255,255,0.06); color: var(--dim); font-size: 11px; }
+.step .dot { width: 8px; height: 8px; border-radius: 50%; border: 1px solid currentColor; }
+.step.done { color: #6f9c83; } .step.done .dot { background: #6f9c83; }
+.step.on { color: #04110a; background: var(--green); border-color: var(--green); font-weight: 700; box-shadow: 0 0 12px rgba(93,255,154,0.35); }
+.step.on .dot { background: #04110a; border-color: #04110a; }
+.annun { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; margin-top: 6px; }
+.lamp { text-align: center; font-size: 10.5px; padding: 3px 0; border-radius: 2px; border: 1px solid rgba(255,255,255,0.1); color: #56636f; background: rgba(0,0,0,0.35); letter-spacing: 0.08em; }
+.lamp.on { color: #04110a; background: var(--green); border-color: var(--green); }
+.lamp.amb { color: #1b1000; background: var(--amber); border-color: var(--amber); }
+.lamp.red { color: #1b0200; background: var(--red); border-color: var(--red); }
+.lamp.cy { color: #00161f; background: var(--cyan); border-color: var(--cyan); }
+
+/* resources */
+#res { right: 10px; top: 10px; width: 262px; }
+.tank { margin: 3px 0 7px; }
+.tank .bar { position: relative; height: 13px; background: rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.12); border-radius: 2px; overflow: hidden; }
+.tank .fill { position: absolute; left: 0; top: 0; bottom: 0; }
+.tank .fill.lox { background: linear-gradient(90deg, #2f7fb3, var(--lox)); }
+.tank .fill.rp1 { background: linear-gradient(90deg, #a8742a, var(--rp1)); }
+.tank .ticks { position: absolute; inset: 0; background: repeating-linear-gradient(90deg, transparent 0 calc(10% - 1px), rgba(0,0,0,0.45) calc(10% - 1px) 10%); }
+.tank .t { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--dim); margin-bottom: 2px; }
+.tank .t b { color: var(--txt); font-weight: 500; }
+#massbar { height: 8px; display: flex; border-radius: 2px; overflow: hidden; margin: 4px 0 7px; border: 1px solid rgba(255,255,255,0.1); }
+#massbar div { height: 100%; }
+
+/* aero */
+#aero { right: 10px; top: 266px; width: 262px; }
+
+/* wind tunnel window (resizable) */
+#tunnelPanel { right: 10px; top: 432px; width: 460px; height: 420px; min-width: 320px; min-height: 260px; max-width: 96vw; max-height: 96vh;
+  display: flex; flex-direction: column; resize: both; overflow: hidden; padding-bottom: 6px; }
+#tunnelPanel::after { content: ""; position: absolute; right: 2px; bottom: 2px; width: 12px; height: 12px; pointer-events: none;
+  background: linear-gradient(135deg, transparent 0 55%, rgba(160,200,230,0.55) 55% 62%, transparent 62% 72%, rgba(160,200,230,0.55) 72% 79%, transparent 79%); }
+.tn-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 6px; }
+.tn-bar .seg { display: flex; border: 1px solid rgba(140,190,225,0.3); border-radius: 3px; overflow: hidden; }
+.tn-bar button { font: inherit; font-size: 11px; color: var(--dim); background: rgba(0,0,0,0.35); border: none; padding: 3px 8px; cursor: pointer; letter-spacing: 0.04em; }
+.tn-bar .seg button + button { border-left: 1px solid rgba(140,190,225,0.22); }
+.tn-bar > button { border: 1px solid rgba(140,190,225,0.3); border-radius: 3px; }
+.tn-bar button:hover { color: var(--txt); }
+.tn-bar button.on { color: #00161f; background: var(--cyan); }
+.tn-view { position: relative; flex: 1; min-height: 120px; border: 1px solid rgba(255,255,255,0.12); border-radius: 3px; overflow: hidden; background: #05080c; }
+.tn-view canvas { position: absolute; left: 0; top: 0; display: block; cursor: zoom-in; }
+.tn-foot { display: flex; justify-content: space-between; gap: 10px; font-size: 10px; color: var(--dim); margin-top: 4px; white-space: nowrap; overflow: hidden; }
+.tn-foot .tn-tip { opacity: 0.75; overflow: hidden; text-overflow: ellipsis; }
+
+/* bottom cluster */
+#cluster { left: 50%; transform: translateX(-50%); bottom: 10px; display: flex; align-items: flex-end; gap: 8px; padding: 18px 10px 10px;
+  background: linear-gradient(180deg, #2c3136 0%, #202428 55%, #181b1f 100%); border: 1px solid #0b0c0e; border-radius: 14px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.08), inset 0 0 0 3px rgba(0,0,0,0.25); backdrop-filter: none; }
+#cluster .gauge { background: #0b0d0f; border-radius: 6px; box-shadow: inset 0 2px 6px rgba(0,0,0,0.8), 0 1px 0 rgba(255,255,255,0.06); padding: 2px; }
+#navball { width: 260px; height: 260px; display: block; }
+.gauge { width: 46px; height: 200px; position: relative; }
+.gauge canvas { width: 46px; height: 200px; display: block; }
+.speedbox { position: absolute; left: 50%; transform: translateX(-50%); top: -30px; background: #050606; border: 1px solid #4a5058; border-radius: 3px; padding: 2px 10px; font-size: 13px; white-space: nowrap; color: #7dffb0; box-shadow: inset 0 1px 4px rgba(0,0,0,0.9); font-weight: 600; }
+.speedbox .k { color: var(--green); font-size: 9.5px; letter-spacing: 0.12em; margin-right: 6px; }
+#navwrap { position: relative; }
+
+/* landing scope */
+#scope { left: 10px; bottom: 10px; padding: 0; background: none; border: none; box-shadow: 0 10px 30px rgba(0,0,0,0.55); border-radius: 12px; backdrop-filter: none; }
+#scope .grip { top: 5px; left: 58px; transform: none; z-index: 2; }
+#scopeCv { width: 300px; height: 335px; display: block; border-radius: 12px; }
+
+/* events */
+#events { left: 10px; top: 392px; width: 250px; max-height: 150px; overflow: hidden; font-size: 10.5px; }
+#events .e { color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#events .e b { color: var(--txt); font-weight: 500; }
+
+/* toasts / help */
+#banner { position: fixed; left: 50%; top: 38%; transform: translate(-50%, -50%); font-size: 34px; font-weight: 700; letter-spacing: 0.2em; padding: 12px 30px; border-radius: 6px; display: none; text-shadow: 0 0 20px currentColor; background: rgba(0,0,0,0.45); border: 1px solid currentColor; }
+#banner small { display: block; font-size: 13px; letter-spacing: 0.08em; margin-top: 6px; font-weight: 400; text-align: center; }
+#help { left: 50%; top: 50%; transform: translate(-50%, -50%); width: 640px; display: none; font-size: 12px; z-index: 10; }
+#help table { width: 100%; border-collapse: collapse; }
+#help td { padding: 3px 6px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+#help td:first-child { color: var(--cyan); white-space: nowrap; width: 150px; vertical-align: top; }
+#hint { position: fixed; right: 10px; bottom: 10px; font-size: 10.5px; color: var(--dim); background: var(--glass); border: 1px solid var(--edge); border-radius: 4px; padding: 4px 8px; }
+#hint b { color: var(--cyan); }
+#err { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; font-size: 16px; color: var(--amber); background: #04070c; text-align: center; padding: 40px; }
+kbd { font-family: var(--mono); background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.18); border-bottom-width: 2px; border-radius: 3px; padding: 0 4px; font-size: 10.5px; color: var(--txt); }
+@media (max-width: 1100px) { #events { display: none; } }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+
+<div id="top" class="panel">
+  <div class="cell"><span class="lbl">飞行时间</span><span class="mid" id="met">T+00:00.0</span></div>
+  <div class="cell"><span class="lbl">高度</span><span><span class="big" id="alt">0</span><span class="unit" id="altU">m</span></span></div>
+  <div class="cell"><span class="lbl">垂直速度</span><span class="mid" id="vs">0.0</span></div>
+  <div class="cell"><span class="lbl">剩余时间</span><span class="mid" id="tgo">--.-</span></div>
+  <div class="cell"><span id="phaseBadge">待命</span><span class="lbl" id="scen" style="margin-top:3px"></span></div>
+</div>
+
+<div id="ap" class="panel">
+  <h3>自动驾驶 <span class="tag" id="apMode">G-FOLD 3D</span></h3>
+  <div class="ladder" id="ladder"></div>
+  <div class="row"><span class="k">求解器</span><span class="v c" id="solver">-</span></div>
+  <div class="row"><span class="k">求解状态</span><span class="v" id="solStat">-</span></div>
+  <div class="row"><span class="k">求解次数</span><span class="v" id="solves">0</span></div>
+  <div class="row"><span class="k">推力余量</span><span class="v" id="margin">-</span></div>
+  <div class="row"><span class="k">指令油门</span><span class="v" id="cmdThr">-</span></div>
+  <div class="row"><span class="k">摆角 俯仰 / 偏航</span><span class="v" id="gimbal">0.0 / 0.0°</span></div>
+  <div class="row"><span class="k">航向 / 俯仰 / 滚转</span><span class="v" id="att">-</span></div>
+  <div class="annun">
+    <div class="lamp" id="lAP">自动</div>
+    <div class="lamp" id="lSAS">增稳</div>
+    <div class="lamp" id="lLEGS">着陆腿</div>
+    <div class="lamp" id="lENG">发动机</div>
+    <div class="lamp" id="lRCS">姿控</div>
+    <div class="lamp" id="lCFD">CFD 驱动</div>
+    <div class="lamp" id="lWIND">风场</div>
+    <div class="lamp" id="lFUEL">推进剂</div>
+    <div class="lamp" id="lCONT">触地</div>
+  </div>
+</div>
+
+<div id="res" class="panel">
+  <h3>推进剂与质量 <span class="tag" id="stageTag">液氧 / 煤油</span></h3>
+  <div class="tank"><div class="t"><span>液氧 LOX</span><b id="loxT">0 kg</b></div><div class="bar"><div class="fill lox" id="loxF"></div><div class="ticks"></div></div></div>
+  <div class="tank"><div class="t"><span>煤油 RP-1</span><b id="rp1T">0 kg</b></div><div class="bar"><div class="fill rp1" id="rp1F"></div><div class="ticks"></div></div></div>
+  <div id="massbar"><div id="mbDry" style="background:#5d6a78"></div><div id="mbLox" style="background:var(--lox)"></div><div id="mbRp1" style="background:var(--rp1)"></div></div>
+  <div class="row"><span class="k">质量</span><span class="v" id="mass">-</span></div>
+  <div class="row"><span class="k">剩余速度增量 Δv</span><span class="v g" id="dv">-</span></div>
+  <div class="row"><span class="k">剩余工作时间</span><span class="v" id="burn">-</span></div>
+  <div class="row"><span class="k">秒流量 ṁ</span><span class="v" id="mdot">-</span></div>
+  <div class="row"><span class="k">比冲 Isp</span><span class="v" id="isp">-</span></div>
+  <div class="row"><span class="k">推力 / 推重比</span><span class="v" id="twr">-</span></div>
+  <div class="row"><span class="k">质心距底面</span><span class="v" id="com">-</span></div>
+</div>
+
+<div id="aero" class="panel">
+  <h3>气动 <span class="tag" id="aeroSrc">工程模型</span></h3>
+  <div class="row"><span class="k">马赫数 / 动压</span><span class="v" id="mach">-</span></div>
+  <div class="row"><span class="k">总攻角 / 迎风端</span><span class="v" id="alpha">-</span></div>
+  <div class="row"><span class="k">阻力 / 法向力</span><span class="v" id="forces">-</span></div>
+  <div class="row"><span class="k">压心 − 质心</span><span class="v" id="margin2">-</span></div>
+  <div class="row"><span class="k">CFD 法向 / 轴向系数</span><span class="v c" id="cfdC">-</span></div>
+  <div class="row"><span class="k">CFD 压心距底面</span><span class="v c" id="cfdCp">-</span></div>
+  <div class="row"><span class="k">主视图气流</span><span class="v" id="flowView">-</span></div>
+</div>
+
+<div id="tunnelPanel" class="panel resizable">
+  <h3>风洞截面 <span class="tag" id="tnTag">东—天 · 世界坐标</span></h3>
+  <div class="tn-bar">
+    <div class="seg" id="tnMode"></div>
+    <div class="seg" id="tnPlane"></div>
+    <button id="tnPart" title="示踪粒子随截面内速度场运动">粒子</button>
+    <button id="tnForce" title="气动合力、压心与质心">受力</button>
+  </div>
+  <div class="tn-view" id="tnWrap"><canvas id="tunnel"></canvas></div>
+  <div class="tn-foot"><span id="tnFoot">-</span><span class="tn-tip">滚轮缩放 · 双击复位 · 拖右下角调整大小</span></div>
+</div>
+
+<div id="cluster" class="panel"><div class="grip" title="拖动以移动姿态仪"></div>
+  <div class="gauge"><canvas id="thrG" width="92" height="400"></canvas></div>
+  <div id="navwrap">
+    <div class="speedbox"><span class="k" id="spdMode">对地速度</span><span id="spd">0.0 m/s</span></div>
+    <canvas id="navball" width="480" height="480"></canvas>
+  </div>
+  <div class="gauge"><canvas id="vsG" width="92" height="400"></canvas></div>
+</div>
+
+<div id="scope" class="panel"><div class="grip" title="拖动以移动着陆区显示器"></div>
+  <canvas id="scopeCv" width="520" height="580"></canvas>
+</div>
+
+<div id="events" class="panel"><h3>事件记录 <span class="tag" id="warp">1×</span></h3><div id="evList"></div></div>
+
+<div id="banner"></div>
+<div id="hint"><b>H</b> 帮助 · <b>M</b> 自动驾驶 · <b>F</b> 主视图气流 · <b>V</b> 相机 · <b>1-6</b> 场景</div>
+
+<div id="help" class="panel">
+  <h3>操作说明 <span class="tag">KSP 键位</span></h3>
+  <table>
+    <tr><td><kbd>W</kbd> <kbd>S</kbd></td><td>俯仰（W 箭头朝下压）</td></tr>
+    <tr><td><kbd>A</kbd> <kbd>D</kbd></td><td>偏航</td></tr>
+    <tr><td><kbd>Q</kbd> <kbd>E</kbd></td><td>滚转</td></tr>
+    <tr><td><kbd>Shift</kbd> / <kbd>Ctrl</kbd></td><td>油门增 / 减（也可用 <kbd>↑</kbd> <kbd>↓</kbd>）；<kbd>Z</kbd> 满油门，<kbd>X</kbd> 关机</td></tr>
+    <tr><td><kbd>T</kbd></td><td>增稳：关 → 姿态保持 → 对准逆速度方向</td></tr>
+    <tr><td><kbd>G</kbd></td><td>着陆腿收放</td></tr>
+    <tr><td><kbd>M</kbd></td><td>自动驾驶（三维 G-FOLD 制导）接通 / 断开</td></tr>
+    <tr><td><kbd>1</kbd> … <kbd>6</kbd></td><td>场景：悬停急停 / 上升段 / 下降段 / 反推返航 / 三维偏置 / 12 km 再入</td></tr>
+    <tr><td><kbd>Backspace</kbd></td><td>回到发射台，手动起飞</td></tr>
+    <tr><td><kbd>F</kbd></td><td>主视图三维气流显示开 / 关（关闭后流场照常计算，风洞截面照常显示）</td></tr>
+    <tr><td><kbd>B</kbd></td><td>切换显示量：染料 / 涡量 / 速度（主视图与风洞截面同步）</td></tr>
+    <tr><td><kbd>C</kbd></td><td>作用在箭体上的气动力：工程模型 ↔ 实时 3D CFD（在工程模型 0.5–2 倍范围内采信）</td></tr>
+    <tr><td><kbd>Y</kbd></td><td>风场开 / 关</td></tr>
+    <tr><td><kbd>V</kbd></td><td>相机：环绕（只随鼠标转动）/ 着陆台 / 侧视；拖动旋转，滚轮缩放，双击恢复自动距离</td></tr>
+    <tr><td>风洞截面</td><td>截面取世界坐标系竖直面（东—天或北—天），过箭体中点，画面上方始终为天向；滚轮缩放，双击复位，拖右下角调整窗口大小</td></tr>
+    <tr><td>拖动面板标题</td><td>移动仪表面板（姿态仪拖顶部把手）；<kbd>L</kbd> 恢复默认布局与窗口大小</td></tr>
+    <tr><td><kbd>,</kbd> <kbd>.</kbd></td><td>时间倍率 − / +；<kbd>P</kbd> 暂停</td></tr>
+  </table>
+</div>
+<div id="err"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

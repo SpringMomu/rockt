@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+native/target/
+.pytest_cache/
+.venv/
+venv/
+artifacts/*
+!artifacts/*.py
+.env
+.env.*
+!.env.example
