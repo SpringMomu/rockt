@@ -43,7 +43,7 @@ SKY_LOW = (70, 148, 226)
 EARTH_HI = (132, 84, 40)
 EARTH_LOW = (84, 52, 24)
 
-PHASES = ("COAST", "BOOSTBACK", "LANDING BURN", "TERMINAL", "LANDED")
+PHASES = ("COAST", "BOOSTBACK", "LANDING BURN", "LANDED")
 
 
 @dataclass
@@ -197,7 +197,6 @@ class Cockpit:
             messages = {
                 "BOOSTBACK": ("BOOSTBACK BURN", CYAN),
                 "LANDING BURN": ("LANDING BURN START", AMBER),
-                "TERMINAL": ("TERMINAL DESCENT", GREEN),
                 "COAST": ("ENGINE CUTOFF - COAST", DIM),
                 "LANDED": ("TOUCHDOWN", GREEN),
             }

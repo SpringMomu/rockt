@@ -34,9 +34,10 @@ It follows the structure of flight-proven powered-descent guidance
   85 % thrust; the remaining authority is reserved for feedback.  If the
   locked time becomes unreachable it is moved to the *earliest* reachable
   time, never simply later.
-* **Terminal descent.**  In the last ~12 m the vehicle stops re-planning and
-  follows a constant-deceleration sink-rate profile to a ~1.3 m/s touchdown
-  while nulling horizontal velocity with a few degrees of tilt.
+* **One burn to touchdown.**  There is no separate terminal-descent phase:
+  the planned landing burn runs all the way to contact.  Re-planning stops
+  only in the last ~1.2 s, and the tilt limit tightens with height so the
+  vehicle is upright when it touches down.
 * **120 Hz tracking.**  Between re-plans the controller follows the planned
   thrust (feed-forward) plus PD feedback on the planned position/velocity.  A
   cascaded attitude loop (angle -> capped body rate -> angular acceleration
@@ -597,13 +598,10 @@ class AutonomousGuidance:
     # Largest thrust tilt from vertical the planner may use for a divert.
     divert_tilt_deg = 70.0
     touchdown_speed = 1.0
-    # Final "TERMINAL" phase (like a real landing's last seconds): below this
-    # height / time-to-go the vehicle stops re-planning and descends
-    # vertically on a constant-deceleration sink-rate profile while nulling
-    # horizontal velocity with at most a few degrees of tilt.
-    terminal_time_to_go = 2.0
-    terminal_height = 12.0
-    terminal_max_tilt_deg = 6.0
+    # No separate terminal phase: the landing burn is flown to contact.
+    # Below ``late_height`` a short time-to-go is normal (the plan is about to
+    # end on the pad); above it, it means the vehicle is running late.
+    late_height = 20.0
     default_target_altitude = 0.0
     landing_altitude = 0.0
 
@@ -627,7 +625,6 @@ class AutonomousGuidance:
         self._desired_rate = 0.0
         self.burn_fraction = self.burn_thrust_fraction
         self._last_search = -math.inf
-        self.terminal_decel: float | None = None
         self.predicted_points: list[tuple[float, float]] = []
         self.phase = "STANDBY"
         self.last_status = "idle"
@@ -891,24 +888,13 @@ class AutonomousGuidance:
         drag_now = np.array([rocket.last_drag.dot(right), rocket.last_drag.dot(up)]) / rocket.mass
 
         t_go = (self.touchdown_time - self.elapsed) if self.touchdown_time is not None else math.inf
-        near_end = t_go <= self.terminal_time_to_go + 2.0
-        if self.burn_locked and self.terminal_decel is None and near_end and (
-            h <= self.terminal_height or (t_go <= self.terminal_time_to_go and h <= 3.0 * self.terminal_height)
-        ):
-            # Hand over to the terminal descent.  The deceleration that joins
-            # the current sink rate to the touchdown speed at h = 0 defines
-            # the profile, so the switch itself is seamless.
-            sink = max(0.0, -vz)
-            need = (sink * sink - self.touchdown_speed**2) / (2.0 * max(h, 0.3))
-            self.terminal_decel = float(np.clip(need, 0.3, 0.6 * (a_max - g)))
-        terminal = self.terminal_decel is not None
-        if self.burn_locked and not terminal and t_go < 1.5:
+        if self.burn_locked and t_go < 1.5 and h > self.late_height:
             # Running late (e.g. heavy disturbance): re-open the touchdown time.
             self.touchdown_time = self.elapsed + 3.0
             self.next_replan = self.elapsed
             t_go = 3.0
 
-        if not terminal and self.mpc.available and self.elapsed >= self.next_replan:
+        if self.mpc.available and self.elapsed >= self.next_replan:
             if not self.burn_locked or t_go > 1.2:
                 self._replan(rocket, state, a_max)
                 self._publish_prediction(rocket)
@@ -924,19 +910,7 @@ class AutonomousGuidance:
         self.time_to_go = t_go
 
         coasting = False
-        if terminal:
-            self.phase = "TERMINAL"
-            a_ref = self.terminal_decel
-            vz_ref = -math.sqrt(self.touchdown_speed**2 + 2.0 * a_ref * max(0.0, h))
-            feed = a_ref if h > 0.2 else 0.0
-            az = g - drag_now[1] + feed + 2.5 * (vz_ref - vz)
-            az = max(az, 0.3 * g)
-            tan_tilt = math.tan(math.radians(self.terminal_max_tilt_deg))
-            ax = -drag_now[0] - 1.2 * vx - 0.25 * x
-            ax = float(np.clip(ax, -tan_tilt * az, tan_tilt * az))
-            accel = np.array([ax, az])
-            max_tilt = math.radians(self.terminal_max_tilt_deg)
-        elif self.plan is not None:
+        if self.plan is not None:
             tau = self.elapsed - self.plan.created_at
             pos_ref, vel_ref, u_ff, _ = self.plan.sample(tau)
             gamma_ff = self.plan.gamma_at(tau)
@@ -962,6 +936,14 @@ class AutonomousGuidance:
                     gap = later.size > 0 and later.min() < 0.06 * a_max
                     self.phase = "BOOSTBACK" if gap else "LANDING BURN"
             max_tilt = math.radians(75.0)
+            if self.burn_locked:
+                # Past the plan's end the reference is "on the pad, sinking at
+                # touchdown speed", so a late vehicle keeps descending.  Never
+                # stall or climb just above the pad.
+                if h < 10.0 and vz > -0.6 * self.touchdown_speed:
+                    accel[1] = min(accel[1], 0.9 * g)
+                # Tilt budget tightens with height: upright at contact.
+                max_tilt = math.radians(float(np.interp(h, [0.3, 1.5, 3.0, 12.0, 40.0], [0.6, 2.0, 4.0, 6.0, 75.0])))
         else:
             # No solver available: bounded suicide-burn feedback law.
             self.phase = "FALLBACK"

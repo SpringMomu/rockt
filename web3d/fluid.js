@@ -25,7 +25,7 @@ void main() { v_ndc = a_p; gl_Position = vec4(a_p, 0.0, 1.0); }`;
 const COMPOSITE_FS = `#version 300 es
 precision highp float;
 in vec2 v_ndc; uniform sampler2D u_image; out vec4 o;
-void main(){ o=texture(u_image,v_ndc*0.5+0.5); }`;
+void main(){ vec4 c=texture(u_image,v_ndc*0.5+0.5); vec3 u=c.a>0.0?c.rgb/c.a:vec3(0.0); o=vec4(pow(u,vec3(2.2))*c.a*0.8,c.a); } // sRGB overlay -> linear HDR target`;
 
 // Atlas helpers shared by all grid passes.
 const COMMON = `
@@ -365,8 +365,8 @@ void main() {
       float dens = max(d.r, max(d.g, d.b));
       vec3 hueC = d.rgb / max(dens, 1e-3);
       col = mix(hueC, vec3(1.0), 0.18) * (0.55 + 0.6 * dens);
-      col = mix(col, vec3(0.80, 0.80, 0.82), d.a / max(dens + d.a, 1e-3));
-      a = 0.30 * smoothstep(0.04, 0.6, dens) + 0.10 * d.a;
+      // Exhaust density (d.a) is no longer drawn as grey smoke in the main view.
+      a = 0.30 * smoothstep(0.04, 0.6, dens);
     } else if (u_mode == 1) {    // vorticity magnitude
       float w = samp(u_curl, p).w / max(u_inflowMag, 0.05);
       float s = smoothstep(0.10, 0.9, w);
@@ -744,9 +744,9 @@ export class Fluid3D {
     gl.uniform1f(p.u.u_inflowMag, this.inflowMag);
     gl.bindVertexArray(this.tri);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, scene.outFbo || null);
     gl.clearColor(0, 0, 0, 1);
-    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    gl.viewport(0, 0, scene.W || gl.drawingBufferWidth, scene.H || gl.drawingBufferHeight);
     gl.useProgram(this.pComposite.program);
     this._bindTex(this.pComposite, "u_image", this.volume.tex, 0);
     gl.enable(gl.BLEND);

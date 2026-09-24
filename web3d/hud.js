@@ -6,7 +6,7 @@ import { TunnelView } from "./tunnel.js";
 import * as ZH from "./zh.js";
 
 const $ = (id) => document.getElementById(id);
-const PHASES = ["COAST", "BOOSTBACK", "LANDING BURN", "TERMINAL", "LANDED"];
+const PHASES = ["COAST", "BOOSTBACK", "LANDING BURN", "LANDED"];
 const PHASE_COL = { STANDBY: "#7f93a6", MANUAL: "#46d6ff", COAST: "#46d6ff", BOOSTBACK: "#ff5ef0", "LANDING BURN": "#ffb43c", TERMINAL: "#5dff9a", LANDED: "#5dff9a", FALLBACK: "#ff5a4e" };
 
 function fmt(x, d = 1) { return x === null || x === undefined || !isFinite(x) ? "--" : x.toFixed(d); }

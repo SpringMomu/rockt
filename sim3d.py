@@ -23,7 +23,25 @@ SCENARIOS = [
     {"name": "BOOSTBACK +1000 m / 100 m/s", "pos": (1000, 300, 2000), "vel": (100, -20, 0), "tilt": 10.0, "prop": 5500},
     {"name": "DIVERT -1000 m / 3-D", "pos": (-1000, 600, 2000), "vel": (100, -40, 0), "tilt": 10.0, "prop": 5500},
     {"name": "ENTRY 12 km / 280 m/s", "pos": (1800, -1100, 12000), "vel": (-88, 54, -260), "tilt": 8.0, "prop": 6000},
+    # ---- return to launch site from stage separation (keys 7, 8, 9, 0) ------
+    # Full Falcon-9 style sequence: the booster starts nose-first, still
+    # climbing and flying AWAY from the pad; it flips, boosts back (in thin
+    # air), coasts over the apogee and re-enters engines-first, steers the
+    # impact point with body lift, then lights one landing burn.
+    # "axis": initial body axis (world), here along the velocity (prograde).
+    # Checked once each (engineering aero, no CFD): boost-back 33-38 s, apogee
+    # 37-51 km, re-entry max-q 19-40 kPa; landed 0.07-0.9 m from the centre.
+    # LOW FUEL lands with ~0.8 t left (about one landing burn of margin).
+    {"name": "RTLS 30 km / 450 m/s", "pos": (6000, 0, 30000), "vel": (300, 0, 330), "axis": (300, 0, 330),
+     "prop": 7000},
+    {"name": "RTLS 35 km / CROSSWIND", "pos": (8000, -2500, 35000), "vel": (340, -90, 360), "axis": (340, -90, 360),
+     "prop": 7500, "wind": (12.0, 45.0, 3.5)},
+    {"name": "RTLS 30 km / LOW FUEL", "pos": (6000, 1500, 30000), "vel": (300, 60, 330), "axis": (300, 60, 330),
+     "prop": 3000},
+    {"name": "RTLS 40 km / GUST + TUMBLE", "pos": (9000, 3000, 40000), "vel": (380, 120, 380), "axis": (380, 120, 330),
+     "prop": 8000, "wind": (15.0, 250.0, 5.0), "omega": (0.08, -0.05, 0.2)},
 ]
+DEFAULT_WIND = (6.0, 90.0, 1.8)   # speed at 10 m (m/s), heading blown toward (deg), gust (m/s)
 
 
 class Sim3D:
@@ -52,13 +70,19 @@ class Sim3D:
     def load_scenario(self, index: int, autopilot: bool = True) -> None:
         with self.lock:
             sc = SCENARIOS[index % len(SCENARIOS)]
-            tilt = math.radians(sc["tilt"])
+            tilt = math.radians(sc.get("tilt", 0.0))
             vel = np.array(sc["vel"], float)
             horiz = np.array([vel[0], vel[1], 0.0])
             axis = np.array([0.0, 1.0, 0.0]) if np.linalg.norm(horiz) < 1e-6 else np.cross([0.0, 0.0, 1.0], horiz / np.linalg.norm(horiz))
             q = quat_from_axis_angle(axis, -tilt)
+            if "axis" in sc:
+                q = quat_between(np.array([0.0, 0.0, 1.0]), np.array(sc["axis"], float))
             self.vehicle.reset(position=sc["pos"], velocity=sc["vel"], attitude=q, propellant=sc["prop"], on_pad=False)
             self.vehicle.pos[2] += self.vehicle._rest_height()
+            if "omega" in sc:
+                self.vehicle.omega = np.array(sc["omega"], float)
+            ws, wh, wg = sc.get("wind", DEFAULT_WIND)
+            self.wind.speed_10m, self.wind.heading_deg, self.wind.gust = float(ws), float(wh), float(wg)
             self.autopilot.reset()
             self.autopilot_on = autopilot
             self.sas = "OFF"
@@ -151,7 +175,7 @@ class Sim3D:
                 self.events.append((self.time, f"{v.state}{': ' + v.crash_reason if v.crash_reason else ''}"))
             ap = self.autopilot
             if ap.phase and (not self.events or not self.events[-1][1].endswith(ap.phase)) and self.autopilot_on:
-                if ap.phase in ("COAST", "BOOSTBACK", "LANDING BURN", "TERMINAL"):
+                if ap.phase in ("COAST", "BOOSTBACK", "LANDING BURN"):
                     if not any(e[1] == f"PHASE {ap.phase}" for e in self.events[-6:]):
                         self.events.append((self.time, f"PHASE {ap.phase}"))
             if len(self.events) > 40:

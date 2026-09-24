@@ -1301,7 +1301,7 @@ def run_landing_scenario(
     touchdown_vx, touchdown_vz = guidance.touchdown_velocity
     pad_error = abs(rocket.position.x - rocket.launch_x)
     backend = guidance.mpc.backend
-    solved = guidance.last_status in {"Solved", "AlmostSolved"} or guidance.phase in {"TERMINAL", "LANDED"}
+    solved = guidance.last_status in {"Solved", "AlmostSolved"} or guidance.phase == "LANDED"
     success = (
         rocket.state == "LANDED"
         and solved

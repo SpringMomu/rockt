@@ -1,106 +1,13 @@
 // 3D scene renderer (WebGL2).  All geometry in world ENU metres, z up.
+// Linear HDR pipeline: MSAA RGBA16F scene target -> resolve -> volumetric
+// plume + lit smoke (soft, depth-aware) -> bloom -> ACES tone map -> sRGB.
 import { M4, V, rot, createProgram, createMesh, drawMesh, createDynamic, uploadDynamic,
   frustum, box, merge, transformPart, polarGrid } from "./gl.js";
+import * as S from "./scene_shaders.js";
+import { plumeParams, EXIT_Z, EXIT_R } from "./plume.js";
 
-const FAR = 160000.0;
-const LOG_FC = 2.0 / Math.log2(FAR + 1.0);
-
-const LOGDEPTH_VS = `
-out float v_logz;
-void logDepth() { v_logz = 1.0 + gl_Position.w; }`;
-const LOGDEPTH_FS = `
-in float v_logz;
-uniform float u_logFC;
-void logDepth() { gl_FragDepth = log2(v_logz) * u_logFC * 0.5; }`;
-
-const NOISE = `
-float hash(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
-float vnoise(vec2 p) {
-  vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
-  return mix(mix(hash(i), hash(i + vec2(1, 0)), u.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), u.x), u.y);
-}
-float fbm(vec2 p) { float s = 0.0, a = 0.5; for (int i = 0; i < 6; i++) { s += a * vnoise(p); p = p * 2.03 + vec2(17.1, 9.2); a *= 0.5; } return s; }
-float terrainHeight(vec2 p) {
-  float r = length(p);
-  float flat_ = smoothstep(420.0, 1100.0, r);
-  float hills = (fbm(p / 2600.0) - 0.45) * 380.0;
-  float ridge = 1.0 - abs(vnoise(p / 9000.0) * 2.0 - 1.0);
-  float mountains = pow(ridge, 3.0) * 2300.0 * smoothstep(9000.0, 26000.0, r);
-  return flat_ * (max(hills, -30.0) + mountains) - 0.02;
-}`;
-
-const SKY_FS = `#version 300 es
-precision highp float;
-in vec2 v_uv; out vec4 o;
-uniform mat4 u_invVP; uniform vec3 u_cam; uniform vec3 u_sun; uniform float u_alt;
-vec3 skyColor(vec3 d) {
-  float h = clamp(u_alt / 22000.0, 0.0, 1.0);
-  vec3 zen = mix(vec3(0.20, 0.42, 0.82), vec3(0.01, 0.03, 0.10), h);
-  vec3 hor = mix(vec3(0.72, 0.82, 0.93), vec3(0.28, 0.40, 0.62), h);
-  float e = max(d.z, 0.0);
-  vec3 c = mix(hor, zen, pow(e, 0.45));
-  float s = max(dot(d, u_sun), 0.0);
-  c += vec3(1.0, 0.85, 0.6) * pow(s, 8.0) * 0.25 + vec3(1.0, 0.95, 0.85) * pow(s, 900.0) * 4.0;
-  if (d.z < 0.0) c = mix(hor * 0.92, vec3(0.45, 0.50, 0.52), clamp(-d.z * 4.0, 0.0, 1.0));
-  return c;
-}
-void main() {
-  vec4 p = u_invVP * vec4(v_uv * 2.0 - 1.0, 1.0, 1.0);
-  vec3 d = normalize(p.xyz / p.w - u_cam);
-  o = vec4(skyColor(d), 1.0);
-}`;
-const SKY_VS = `#version 300 es
-out vec2 v_uv;
-void main() { vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); v_uv = p; gl_Position = vec4(p * 2.0 - 1.0, 0.9999999, 1.0); }`;
-
-const TERRAIN_VS = `#version 300 es
-precision highp float;
-layout(location=0) in vec3 a_pos;
-uniform mat4 u_vp; out vec3 v_world; out vec3 v_n;
-${NOISE}
-${LOGDEPTH_VS}
-void main() {
-  vec3 p = vec3(a_pos.xy, 0.0); p.z = terrainHeight(p.xy);
-  // Smooth vertex normal (finite differences at the local mesh scale).
-  float e = max(1.5, 0.03 * length(p.xy));
-  float hx = terrainHeight(p.xy + vec2(e, 0.0)) - terrainHeight(p.xy - vec2(e, 0.0));
-  float hy = terrainHeight(p.xy + vec2(0.0, e)) - terrainHeight(p.xy - vec2(0.0, e));
-  v_n = normalize(vec3(-hx, -hy, 2.0 * e));
-  v_world = p; gl_Position = u_vp * vec4(p, 1.0); logDepth();
-}`;
-const TERRAIN_FS = `#version 300 es
-precision highp float;
-precision highp sampler2DShadow;
-in vec3 v_world; in vec3 v_n; out vec4 o;
-uniform vec3 u_cam; uniform vec3 u_sun; uniform float u_alt; uniform float u_time;
-uniform mat4 u_shadowVP; uniform sampler2DShadow u_shadow;
-uniform vec3 u_plumePos; uniform float u_plumeI;
-${NOISE}
-${LOGDEPTH_FS}
-vec3 fogColor(vec3 d) {
-  float h = clamp(u_alt / 22000.0, 0.0, 1.0);
-  return mix(vec3(0.70, 0.80, 0.91), vec3(0.30, 0.42, 0.62), h);
-}
-float shadowAt(vec3 p) {
-  vec4 s = u_shadowVP * vec4(p, 1.0); vec3 c = s.xyz / s.w * 0.5 + 0.5;
-  if (c.x <= 0.0 || c.x >= 1.0 || c.y <= 0.0 || c.y >= 1.0 || c.z >= 1.0) return 1.0;
-  float sum = 0.0; vec2 texel = vec2(1.0 / 2048.0);
-  for (int i = -1; i <= 1; i++) for (int j = -1; j <= 1; j++) sum += texture(u_shadow, vec3(c.xy + vec2(i, j) * texel, c.z - 0.0015));
-  return sum / 9.0;
-}
-void main() {
-  logDepth();
-  vec3 p = v_world;
-  vec3 n = normalize(v_n);
-  float r = length(p.xy);
-  float slope = 1.0 - n.z;
-  float nz = fbm(p.xy / 38.0), nz2 = vnoise(p.xy / 4.0), big = fbm(p.xy / 700.0);
-  vec3 grass = mix(vec3(0.20, 0.33, 0.12), vec3(0.34, 0.42, 0.18), nz);
-  grass = mix(grass, vec3(0.45, 0.43, 0.26), smoothstep(0.55, 0.8, big) * 0.6);
-  vec3 rock = mix(vec3(0.36, 0.34, 0.31), vec3(0.50, 0.48, 0.45), nz2);
-  vec3 col = mix(grass, rock, smoothstep(0.18, 0.42, slope));
-  col = mix(col, vec3(0.93, 0.95, 0.98), smoothstep(1300.0, 1700.0, p.z + nz * 200.0) * smoothstep(0.55, 0.2, slope));
-  // ---- Landing zone: access road, apron, drainage trench, pad with markings,
+const FAR = S.FAR, LOG_FC = S.LOG_FC;
+const TERRAIN_MARKINGS = `  // ---- Landing zone: access road, apron, drainage trench, pad with markings,
   // hazard band, tie-downs, heading arrow, blast streaks and engine scorch.
   float ang = atan(p.y, p.x);
   const float TAU = 6.2831853;
@@ -184,233 +91,95 @@ void main() {
     // Engine scorch + radial blast streaks (painted markings get burnt too).
     float scorch = smoothstep(14.0, 0.0, r + (nz - 0.5) * 7.0);
     float streak = pow(vnoise(vec2(ang * 34.0, r * 0.05)), 2.6) * smoothstep(20.0, 4.0, r);
-    col = mix(col, vec3(0.08, 0.075, 0.07), clamp(scorch * 0.78 + streak * 0.28, 0.0, 0.9));
+    col = mix(col, vec3(0.08, 0.075, 0.07), clamp(scorch * 0.78 + streak * 0.1, 0.0, 0.9));
   }
-  float sh = shadowAt(p + n * 0.05);
-  float diff = max(dot(n, u_sun), 0.0) * sh;
-  vec3 light = vec3(1.0, 0.96, 0.88) * diff * 1.05 + vec3(0.42, 0.50, 0.62) * (0.45 + 0.35 * n.z);
-  vec3 lp = u_plumePos - p; float d2 = dot(lp, lp);
-  light += vec3(1.0, 0.55, 0.18) * u_plumeI * max(dot(n, normalize(lp)), 0.0) * 900.0 / (d2 + 60.0);
-  col *= light;
-  float dist = length(p - u_cam);
-  float fog = 1.0 - exp(-dist / mix(26000.0, 70000.0, clamp(u_alt / 12000.0, 0.0, 1.0)));
-  o = vec4(mix(col, fogColor(normalize(p - u_cam)), fog), 1.0);
-}`;
+`;
 
-const LIT_VS = `#version 300 es
-precision highp float;
-layout(location=0) in vec3 a_pos; layout(location=1) in vec3 a_nrm; layout(location=2) in vec2 a_ex;
-uniform mat4 u_vp; uniform mat4 u_model;
-out vec3 v_world; out vec3 v_n; out vec3 v_nb; out vec2 v_ex; out vec3 v_pb;
-${LOGDEPTH_VS}
-void main() {
-  vec4 w = u_model * vec4(a_pos, 1.0);
-  v_world = w.xyz; v_n = normalize(mat3(u_model) * a_nrm); v_nb = a_nrm; v_ex = a_ex; v_pb = a_pos;
-  gl_Position = u_vp * w; logDepth();
-}`;
-const LIT_FS = `#version 300 es
-precision highp float;
-in vec3 v_world; in vec3 v_n; in vec3 v_nb; in vec2 v_ex; in vec3 v_pb; out vec4 o;
-uniform vec3 u_cam; uniform vec3 u_sun; uniform int u_mat; uniform vec3 u_color;
-uniform vec3 u_plumePos; uniform float u_plumeI; uniform int u_cpMode; uniform vec3 u_flowB; uniform float u_sinA;
-${NOISE}
-${LOGDEPTH_FS}
-vec3 cpColor(float cp) {
-  vec3 neg = vec3(0.10, 0.35, 1.0), pos = vec3(1.0, 0.25, 0.10);
-  return cp < 0.0 ? mix(vec3(1.0), neg, clamp(-cp / 2.5, 0.0, 1.0)) : mix(vec3(1.0), pos, clamp(cp, 0.0, 1.0));
-}
-void main() {
-  logDepth();
-  vec3 n = normalize(v_n); if (!gl_FrontFacing) n = -n;
-  vec3 vd = normalize(u_cam - v_world);
-  float z = v_pb.z; float az = v_ex.x;
-  vec3 base = u_color; float shin = 30.0; float spec = 0.25;
-  if (u_mat == 0) {
-    base = vec3(0.90, 0.91, 0.92);
-    float streak = vnoise(vec2(az * 60.0, z * 0.25)) * 0.6 + vnoise(vec2(az * 180.0, z * 1.3)) * 0.4;
-    float soot = smoothstep(8.5, 0.8, z + streak * 3.0) * 0.85 + smoothstep(14.5, 3.0, z) * streak * 0.25;
-    base = mix(base, vec3(0.10, 0.09, 0.085), clamp(soot, 0.0, 0.95));
-    if (z > 14.95) { base = vec3(0.06, 0.065, 0.07); shin = 60.0; spec = 0.35; }
-    if (z < 1.05) { base = vec3(0.12, 0.12, 0.13); }
-  } else if (u_mat == 2) { shin = 80.0; spec = 0.6; }
-  else if (u_mat == 3) {
-    vec2 g = abs(fract(v_ex * vec2(7.0, 6.0)) - 0.5);
-    base = mix(vec3(0.10, 0.10, 0.11), vec3(0.45, 0.46, 0.48), step(0.38, max(g.x, g.y)));
-    spec = 0.5; shin = 50.0;
-  }
-  else if (u_mat == 5) { // weathered concrete (ground props)
-    base = u_color * (0.82 + 0.26 * vnoise(v_world.xy * 1.7 + v_world.z * 1.3)) * (1.0 - 0.25 * smoothstep(0.6, 0.0, v_world.z));
-    spec = 0.05; shin = 8.0;
-  } else if (u_mat == 6) { // yellow / black hazard paint
-    float st = step(0.5, fract((v_world.x + v_world.y + v_world.z) / 0.7));
-    base = mix(vec3(0.92, 0.72, 0.10), vec3(0.05, 0.05, 0.05), st);
-    spec = 0.2; shin = 20.0;
-  } else if (u_mat == 8) { // corrugated steel (containers, shed walls)
-    float rib = smoothstep(0.25, 0.75, abs(fract(v_ex.x * 22.0) - 0.5) * 2.0);
-    base = u_color * (0.80 + 0.20 * rib) * (0.9 + 0.2 * vnoise(v_world.xy * 0.8 + v_world.z));
-    spec = 0.3; shin = 35.0;
-  }
-  if (u_cpMode == 1 && (u_mat == 0)) {
-    // Surface pressure coefficient: crossflow potential flow around the
-    // cylinder (scaled by sin^2 alpha) + stagnation on the leading end.
-    vec3 nb = normalize(v_nb);
-    vec3 fperp = u_flowB - dot(u_flowB, vec3(0, 0, 1)) * vec3(0, 0, 1);
-    float cp = 0.0;
-    if (length(fperp) > 1e-3 && abs(nb.z) < 0.5) {
-      float c = -dot(normalize(nb.xy), normalize(fperp.xy));
-      float s2 = 1.0 - c * c;
-      cp = u_sinA * u_sinA * (1.0 - 4.0 * s2);
-      if (c < -0.2) cp = u_sinA * u_sinA * -0.6; // separated wake
+// Surface of revolution from a [r, z] profile (top -> bottom), smooth normals.
+// extra = (azimuth fraction, z) like frustum().
+function lathe(profile, seg = 48) {
+  const d = [], idx = [];
+  const n = profile.length;
+  const nrm2 = profile.map((p, i) => {
+    const a = profile[Math.max(0, i - 1)], b = profile[Math.min(n - 1, i + 1)];
+    const dr = b[0] - a[0], dz = b[1] - a[1], l = Math.hypot(dr, dz) || 1;
+    return [-dz / l, dr / l];                       // outward for a top->bottom profile
+  });
+  for (let k = 0; k < n; k++) {
+    for (let i = 0; i <= seg; i++) {
+      const a = (i / seg) * Math.PI * 2, c = Math.cos(a), s = Math.sin(a);
+      const [r, z] = profile[k], [nr, nz] = nrm2[k];
+      d.push(c * r, s * r, z, c * nr, s * nr, nz, i / seg, z);
     }
-    float axial = dot(u_flowB, vec3(0, 0, 1));
-    float leadZ = axial > 0.0 ? 0.0 : 18.0;
-    cp += (1.0 - u_sinA * u_sinA) * smoothstep(3.0, 0.0, abs(z - leadZ)) * 0.9;
-    base = cpColor(cp);
   }
-  float diff = max(dot(n, u_sun), 0.0);
-  vec3 h = normalize(u_sun + vd);
-  float sp = pow(max(dot(n, h), 0.0), shin) * spec;
-  float fres = pow(1.0 - max(dot(n, vd), 0.0), 4.0);
-  vec3 amb = vec3(0.40, 0.47, 0.58) * (0.55 + 0.45 * n.z) + vec3(0.16, 0.14, 0.12) * (0.5 - 0.5 * n.z);
-  vec3 col = base * (vec3(1.0, 0.96, 0.9) * diff * 1.1 + amb) + vec3(1.0, 0.97, 0.9) * sp * step(0.0, diff) + amb * fres * 0.35;
-  vec3 lp = u_plumePos - v_world; float d2 = dot(lp, lp);
-  col += base * vec3(1.0, 0.55, 0.18) * u_plumeI * max(dot(n, normalize(lp)), 0.0) * 260.0 / (d2 + 12.0);
-  if (u_mat == 9) col = u_color; // unlit (markers)
-  o = vec4(col, 1.0);
-}`;
-
-const DEPTH_FS = `#version 300 es
-precision highp float; void main() {}`;
-const DEPTH_VS = `#version 300 es
-layout(location=0) in vec3 a_pos; uniform mat4 u_vp; uniform mat4 u_model;
-void main() { gl_Position = u_vp * u_model * vec4(a_pos, 1.0); }`;
-
-const PLUME_VS = `#version 300 es
-precision highp float;
-layout(location=0) in vec3 a_pos; layout(location=1) in vec3 a_nrm; layout(location=2) in vec2 a_ex;
-uniform mat4 u_vp; uniform mat4 u_model; uniform float u_len; uniform float u_r0; uniform float u_expand;
-out vec3 v_world; out vec3 v_n; out float v_s;
-${LOGDEPTH_VS}
-void main() {
-  float s = clamp(a_pos.z, 0.0, 1.0);
-  float r = u_r0 * (1.0 + u_expand * s) * (1.0 - 0.55 * pow(s, 3.0));
-  vec3 p = vec3(a_pos.xy * r, s * u_len);
-  vec4 w = u_model * vec4(p, 1.0);
-  v_world = w.xyz; v_n = normalize(mat3(u_model) * vec3(a_nrm.xy, 0.0)); v_s = s;
-  gl_Position = u_vp * w; logDepth();
-}`;
-const PLUME_FS = `#version 300 es
-precision highp float;
-in vec3 v_world; in vec3 v_n; in float v_s; out vec4 o;
-uniform vec3 u_cam; uniform float u_time; uniform float u_int; uniform vec3 u_c0; uniform vec3 u_c1; uniform float u_len; uniform float u_diamonds;
-${NOISE}
-${LOGDEPTH_FS}
-void main() {
-  if (v_world.z < 0.05) discard;
-  logDepth();
-  vec3 vd = normalize(u_cam - v_world);
-  float edge = pow(abs(dot(normalize(v_n), vd)), 1.3);
-  float fade = pow(1.0 - v_s, 1.25) * smoothstep(0.0, 0.04, v_s);
-  float flick = 0.85 + 0.3 * vnoise(vec2(v_s * 9.0 - u_time * 18.0, u_time * 3.0));
-  float dia = 1.0 + u_diamonds * 0.8 * pow(max(0.0, cos(v_s * u_len / 2.3 * 6.2832)), 6.0) * (1.0 - v_s);
-  vec3 c = mix(u_c0, u_c1, smoothstep(0.0, 0.8, v_s));
-  o = vec4(c * edge * fade * flick * dia * u_int, 1.0);
-}`;
-
-const POINT_VS = `#version 300 es
-precision highp float;
-layout(location=0) in vec3 a_pos; layout(location=1) in vec4 a_col; layout(location=2) in float a_size;
-uniform mat4 u_vp; uniform float u_scale;
-out vec4 v_col;
-${LOGDEPTH_VS}
-void main() { gl_Position = u_vp * vec4(a_pos, 1.0); gl_PointSize = clamp(a_size * u_scale / gl_Position.w, 1.5, 512.0); v_col = a_col; logDepth(); }`;
-const POINT_FS = `#version 300 es
-precision highp float;
-in vec4 v_col; out vec4 o;
-${LOGDEPTH_FS}
-void main() {
-  vec2 d = gl_PointCoord * 2.0 - 1.0; float r2 = dot(d, d); if (r2 > 1.0) discard;
-  logDepth();
-  float a = v_col.a * pow(1.0 - r2, 1.6);
-  o = vec4(v_col.rgb * a, a);
-}`;
-
-const LINE_VS = `#version 300 es
-precision highp float;
-layout(location=0) in vec3 a_pos; layout(location=1) in vec4 a_col;
-uniform mat4 u_vp; out vec4 v_col;
-${LOGDEPTH_VS}
-void main() { gl_Position = u_vp * vec4(a_pos, 1.0); v_col = a_col; logDepth(); }`;
-const LINE_FS = `#version 300 es
-precision highp float;
-in vec4 v_col; out vec4 o;
-${LOGDEPTH_FS}
-void main() { logDepth(); o = vec4(v_col.rgb * v_col.a, v_col.a); }`;
-
-const SLICE_VS = `#version 300 es
-precision highp float;
-layout(location=0) in vec3 a_pos; layout(location=1) in vec3 a_nrm; layout(location=2) in vec2 a_ex;
-uniform mat4 u_vp; uniform vec3 u_origin; uniform vec3 u_ax; uniform vec3 u_ay; uniform vec2 u_size;
-out vec2 v_uv; out vec3 v_world;
-${LOGDEPTH_VS}
-void main() {
-  v_uv = a_ex; vec3 p = u_origin + u_ax * (a_ex.x - 0.36) * u_size.x + u_ay * (a_ex.y - 0.5) * u_size.y;
-  v_world = p; gl_Position = u_vp * vec4(p, 1.0); logDepth();
-}`;
-const SLICE_FS = `#version 300 es
-precision highp float;
-in vec2 v_uv; in vec3 v_world; out vec4 o;
-uniform sampler2D u_tex; uniform sampler2D u_solid; uniform int u_mode; uniform float u_alpha;
-${LOGDEPTH_FS}
-vec3 diverge(float t) { // t in [-1,1]: blue - white - red
-  return t < 0.0 ? mix(vec3(0.95), vec3(0.05, 0.35, 1.0), -t) : mix(vec3(0.95), vec3(1.0, 0.2, 0.05), t);
+  const row = seg + 1;
+  for (let k = 0; k < n - 1; k++) for (let i = 0; i < seg; i++) {
+    const B0 = k * row + i, A0 = (k + 1) * row + i;          // A = lower ring, B = upper ring
+    idx.push(A0, A0 + 1, B0, B0, A0 + 1, B0 + 1);
+  }
+  return { d, idx };
 }
-vec3 turbo(float t) {
-  return clamp(vec3(0.13572138 + t * (4.61539260 + t * (-42.66032258 + t * (132.13108234 + t * (-152.94239396 + t * 59.28637943)))),
-                    0.09140261 + t * (2.19418839 + t * (4.84296658 + t * (-14.18503333 + t * (4.27729857 + t * 2.82956604)))),
-                    0.10667330 + t * (12.64194608 + t * (-60.58204836 + t * (110.36276771 + t * (-89.90310912 + t * 27.34824973))))), 0.0, 1.0);
+// Box tapered along z (w0 x t0 at z=0 to w1 x t1 at z=len), flat shaded.
+function taperedBox(w0, t0, w1, t1, len) {
+  const c = [];
+  for (const [z, w, t] of [[0, w0, t0], [len, w1, t1]]) for (const [sx, sy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) c.push([sx * t / 2, sy * w / 2, z]);
+  const faces = [[0, 1, 2, 3], [7, 6, 5, 4], [0, 4, 5, 1], [1, 5, 6, 2], [2, 6, 7, 3], [3, 7, 4, 0]];
+  const d = [], idx = [];
+  for (const f of faces) {
+    const [a, b, cc] = f.map((i) => c[i]);
+    let nn = V.norm(V.cross(V.sub(b, a), V.sub(cc, a)));
+    const ctr = f.reduce((s, i) => V.add(s, c[i]), [0, 0, 0]);
+    if (V.dot(nn, V.sub(V.mul(ctr, 0.25), [0, 0, len / 2])) < 0) nn = V.mul(nn, -1);
+    const base = d.length / 8;
+    f.forEach((i, k) => d.push(...c[i], ...nn, k & 1, k >> 1));
+    idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  }
+  return { d, idx };
 }
-void main() {
-  if (v_world.z < 0.05) discard;
-  if (texture(u_solid, v_uv).r > 0.5) discard;
-  logDepth();
-  float v = texture(u_tex, v_uv).r;
-  vec3 c; float a;
-  if (u_mode == 2) { c = turbo(v); a = 0.55; }
-  else { float t = (v - 0.5) * 2.0; c = diverge(t); a = smoothstep(0.06, 0.7, abs(t)) * 0.8; }
-  float edge = smoothstep(0.0, 0.06, min(min(v_uv.x, 1.0 - v_uv.x), min(v_uv.y, 1.0 - v_uv.y)));
-  vec2 q = (v_uv - vec2(0.42, 0.5)) * vec2(1.6, 2.2);
-  edge *= 1.0 - smoothstep(0.55, 1.0, length(q));      // soft vignette around the booster
-  a *= edge * u_alpha;
-  o = vec4(c * a, a);
-}`;
+// Beam (box) between two points.
+function beamBetween(a, b, w, h = w) {
+  const dir = V.sub(b, a), len = V.len(dir), zax = V.norm(dir);
+  const axr = V.cross([0, 0, 1], zax), an = Math.acos(Math.max(-1, Math.min(1, zax[2])));
+  const m = M4.mul(M4.translate(a), M4.mul(V.len(axr) > 1e-6 ? M4.rotAxis(axr, an) : (zax[2] < 0 ? M4.rotAxis([1, 0, 0], Math.PI) : M4.ident()), M4.scale([1, 1, len])));
+  return transformPart(box(w, h, 1, 0, 0, 0.5), m);
+}
 
-// ---------------------------------------------------------------------------
 export class Scene {
   constructor(canvas) {
-    const gl = canvas.getContext("webgl2", { antialias: true, alpha: false, preserveDrawingBuffer: true });
+    const gl = canvas.getContext("webgl2", { antialias: false, alpha: false, preserveDrawingBuffer: true });
     if (!gl) throw new Error("WebGL2 is not available in this browser");
     this.gl = gl;
     this.canvas = canvas;
+    this.hdr = !!gl.getExtension("EXT_color_buffer_float");
+    gl.getExtension("OES_texture_float_linear");
     this.sun = V.norm([-0.55, -0.62, 0.56]);
-    this.progSky = createProgram(gl, SKY_VS, SKY_FS);
-    this.progTerrain = createProgram(gl, TERRAIN_VS, TERRAIN_FS);
-    this.progLit = createProgram(gl, LIT_VS, LIT_FS);
-    this.progDepth = createProgram(gl, DEPTH_VS, DEPTH_FS);
-    this.progPlume = createProgram(gl, PLUME_VS, PLUME_FS);
-    this.progPoint = createProgram(gl, POINT_VS, POINT_FS);
-    this.progLine = createProgram(gl, LINE_VS, LINE_FS);
-    this.progSlice = createProgram(gl, SLICE_VS, SLICE_FS);
+    this.exposure = 1.05;
+    this.bloomK = 0.12;
+    this.progSky = createProgram(gl, S.SKY_VS, S.SKY_FS);
+    this.progTerrain = createProgram(gl, S.TERRAIN_VS, S.terrainFS(TERRAIN_MARKINGS));
+    this.progLit = createProgram(gl, S.LIT_VS, S.LIT_FS);
+    this.progDepth = createProgram(gl, S.DEPTH_VS, S.DEPTH_FS);
+    this.progPoint = createProgram(gl, S.POINT_VS, S.POINT_FS);
+    this.progLine = createProgram(gl, S.LINE_VS, S.LINE_FS);
+    this.progPlume = createProgram(gl, S.FS_VS, S.PLUME_FS);
+    this.progPart = createProgram(gl, S.PART_VS, S.PART_FS);
+    this.progDown = createProgram(gl, S.FS_VS, S.DOWN_FS);
+    this.progUp = createProgram(gl, S.FS_VS, S.UP_FS);
+    this.progComp = createProgram(gl, S.FS_VS, S.COMPOSITE_FS);
+    this.progCopy = createProgram(gl, S.FS_VS, S.COPY_FS);
+    this.progRcs = createProgram(gl, S.RCS_VS, S.RCS_FS);
+    const rc = frustum(1, 1, 0, 1, 20, false);
+    this.meshRcsJet = createMesh(gl, rc.d, rc.idx);
     const t = polarGrid(230, 200, 3.0, 1.0415);
     this.terrain = createMesh(gl, t.d, t.idx);
     this._buildRocket();
     this._buildPadProps();
-    const pl = frustum(1, 1, 0, 1, 36, false);
-    this.plumeMesh = createMesh(gl, pl.d, pl.idx);
     const q = { d: [0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 1], idx: [0, 1, 2, 0, 2, 3] };
     this.quad = createMesh(gl, q.d, q.idx);
     this.points = createDynamic(gl, 6000);
     this.lines = createDynamic(gl, 60000);
+    this.emptyVao = gl.createVertexArray();
+    this._initParticles(2000);
     // Shadow map.
     this.shadowSize = 2048;
     this.shadowTex = gl.createTexture();
@@ -425,60 +194,151 @@ export class Scene {
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.shadowFbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, this.shadowTex, 0);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    // CFD textures.
-    this.cfdTex = this._tex(); this.solidTex = this._tex();
-    this.cfdMeta = null;
+    this.targets = null;
+    this.outFbo = null;
     this.time = 0;
   }
 
-  _tex() {
+  // ------------------------------------------------------------ render targets
+  _texture(w, h, ifmt, fmt, type, filter) {
     const gl = this.gl, t = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, t);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texImage2D(gl.TEXTURE_2D, 0, ifmt, w, h, 0, fmt, type, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array([128]));
     return t;
   }
-
-  setCFD(meta, field, solid) {
+  _fbo(color, depth) {
+    const gl = this.gl, f = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    if (color) gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color, 0);
+    if (depth) gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depth, 0);
+    return f;
+  }
+  _ensureTargets(W, H) {
+    if (this.targets && this.targets.W === W && this.targets.H === H) return;
     const gl = this.gl;
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.bindTexture(gl.TEXTURE_2D, this.cfdTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, meta.nx, meta.ny, 0, gl.RED, gl.UNSIGNED_BYTE, field);
-    gl.bindTexture(gl.TEXTURE_2D, this.solidTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, meta.nx, meta.ny, 0, gl.RED, gl.UNSIGNED_BYTE, solid);
-    this.cfdMeta = meta;
+    if (this.targets) {
+      const o = this.targets;
+      [o.colorTex, o.depthTex, o.plumeTex, ...o.bloom.map((b) => b.tex)].forEach((t) => gl.deleteTexture(t));
+      [o.msFbo, o.resolveFbo, o.transFbo, o.plumeFbo, ...o.bloom.map((b) => b.fbo)].forEach((f) => gl.deleteFramebuffer(f));
+      [o.msColor, o.msDepth].forEach((r) => gl.deleteRenderbuffer(r));
+    }
+    const ifmt = this.hdr ? gl.RGBA16F : gl.RGBA8, type = this.hdr ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
+    const samples = Math.min(4, gl.getParameter(gl.MAX_SAMPLES) || 1);
+    const msColor = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, msColor);
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, ifmt, W, H);
+    const msDepth = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, msDepth);
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.DEPTH_COMPONENT24, W, H);
+    const msFbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, msFbo);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, msColor);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, msDepth);
+    const colorTex = this._texture(W, H, ifmt, gl.RGBA, type, gl.LINEAR);
+    const depthTex = this._texture(W, H, gl.DEPTH_COMPONENT24, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, gl.NEAREST);
+    const resolveFbo = this._fbo(colorTex, depthTex);
+    const transFbo = this._fbo(colorTex, null);
+    const bloom = [];
+    let w = W, h = H;
+    for (let i = 0; i < 6; i++) {
+      w = Math.max(1, w >> 1); h = Math.max(1, h >> 1);
+      const tex = this._texture(w, h, ifmt, gl.RGBA, type, gl.LINEAR);
+      bloom.push({ tex, fbo: this._fbo(tex, null), w, h });
+      if (w <= 4 || h <= 4) break;
+    }
+    const PW = Math.max(1, W >> 1), PH = Math.max(1, H >> 1);
+    const plumeTex = this._texture(PW, PH, ifmt, gl.RGBA, type, gl.LINEAR);
+    const plumeFbo = this._fbo(plumeTex, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.targets = { W, H, PW, PH, msColor, msDepth, msFbo, colorTex, depthTex, resolveFbo, transFbo, plumeTex, plumeFbo, bloom };
+  }
+
+  _initParticles(max) {
+    const gl = this.gl;
+    this.partMax = max;
+    this.partVao = gl.createVertexArray();
+    gl.bindVertexArray(this.partVao);
+    const qb = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
+    this.partBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.partBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, max * 12 * 4, gl.DYNAMIC_DRAW);
+    for (let k = 0; k < 3; k++) {
+      gl.enableVertexAttribArray(1 + k);
+      gl.vertexAttribPointer(1 + k, 4, gl.FLOAT, false, 48, k * 16);
+      gl.vertexAttribDivisor(1 + k, 1);
+    }
+    gl.bindVertexArray(null);
   }
 
   _buildRocket() {
     const gl = this.gl;
-    const body = merge([frustum(1.5, 1.5, 0.0, 15.0, 48), frustum(1.5, 1.5, 15.0, 18.0, 48)]);
+    // Tank barrel + interstage (radius 1.5 m, 18 m), raceway along +x.
+    const body = merge([frustum(1.5, 1.5, 0.0, 15.0, 128), frustum(1.5, 1.5, 15.0, 18.0, 128),
+      box(0.26, 0.34, 13.7, 1.56, 0, 1.3 + 13.7 / 2),                        // raceway (cable tunnel)
+      box(0.2, 0.5, 0.5, 1.52, 0, 14.8)]);
     this.meshBody = createMesh(gl, body.d, body.idx);
-    const bell = frustum(0.86, 0.34, -1.6, 0.3, 32, false);
+    // Merlin bell: throat at z=-0.2, exit (r = EXIT_R) at EXIT_Z, parabolic contour.
+    const bellProfile = (re, zt, ze, rt) => {
+      const p = [];
+      for (let i = 0; i <= 14; i++) { const t = i / 14; p.push([rt + (re - rt) * (1 - Math.pow(1 - t, 2.1)), zt + (ze - zt) * t]); }
+      return p;
+    };
+    const bell = lathe(bellProfile(EXIT_R, -0.2, EXIT_Z, 0.14), 40);
     this.meshBell = createMesh(gl, bell.d, bell.idx);
+    // Outer eight engines (fixed during the single-engine landing burn) + hardware.
+    const outer = [], hw = [];
+    const ringR = 1.02;
+    for (let k = 0; k < 8; k++) {
+      const a = (k / 8) * Math.PI * 2 + Math.PI / 8;
+      const m = M4.translate([Math.cos(a) * ringR, Math.sin(a) * ringR, 0]);
+      outer.push(transformPart(lathe(bellProfile(EXIT_R, -0.2, EXIT_Z, 0.14), 32), m));
+      hw.push(transformPart(frustum(0.2, 0.16, -0.22, 0.0, 16), m));        // chamber / injector
+      hw.push(transformPart(box(0.22, 0.14, 0.2, 0.22, 0, -0.1), M4.mul(m, M4.rotAxis([0, 0, 1], a))));  // turbopump exhaust stub
+    }
+    hw.push(frustum(0.2, 0.16, -0.22, 0.3, 16));                            // centre engine chamber
+    const om = merge(outer); this.meshOuterBells = createMesh(gl, om.d, om.idx);
+    const hm = merge(hw); this.meshEngineHW = createMesh(gl, hm.d, hm.idx);
+    // Grid fins: titanium lattice, deployed (flow passes through the cells along the body axis).
     const fins = [];
     for (let k = 0; k < 4; k++) {
-      const a = (k * Math.PI) / 2;
-      const f = box(1.35, 0.14, 1.2, 1.5 + 0.67, 0, 16.8);
-      fins.push(transformPart(f, M4.rotAxis([0, 0, 1], a)));
+      const parts = [];
+      const x0 = 1.6, x1 = 2.85, y0 = -0.62, y1 = 0.62, zc = 16.8, dep = 0.32;
+      parts.push(box(x1 - x0, 0.06, dep, (x0 + x1) / 2, y0, zc), box(x1 - x0, 0.06, dep, (x0 + x1) / 2, y1, zc));
+      parts.push(box(0.06, y1 - y0 + 0.06, dep, x1, 0, zc), box(0.08, y1 - y0 + 0.06, dep, x0, 0, zc));
+      const sp = 0.155;
+      for (const sgn of [1, -1]) for (let c = -3; c <= 3; c += sp) {
+        // lines x - sgn*y = c + mid
+        const cx = (x0 + x1) / 2;
+        let ya = Math.max(y0, sgn > 0 ? x0 - (cx + c) : (cx + c) - x1), yb = Math.min(y1, sgn > 0 ? x1 - (cx + c) : (cx + c) - x0);
+        if (yb - ya < 0.05) continue;
+        const pa = [cx + c + sgn * ya, ya, zc], pb = [cx + c + sgn * yb, yb, zc];
+        const L = V.len(V.sub(pb, pa)), mid = V.mul(V.add(pa, pb), 0.5);
+        const ang = Math.atan2(pb[1] - pa[1], pb[0] - pa[0]);
+        parts.push(transformPart(box(L, 0.022, dep - 0.02, 0, 0, 0), M4.mul(M4.translate(mid), M4.rotAxis([0, 0, 1], ang))));
+      }
+      parts.push(box(0.2, 0.3, 0.5, 1.5, 0, zc - 0.05));                  // hinge / actuator fairing
+      fins.push(transformPart(merge(parts), M4.rotAxis([0, 0, 1], (k * Math.PI) / 2)));
     }
     const fm = merge(fins);
     this.meshFins = createMesh(gl, fm.d, fm.idx);
-    const leg = merge([box(0.34, 0.26, 6.2, 0, 0, 3.1), box(1.0, 0.8, 0.12, 0, 0, 6.2)]);
+    // Landing leg: tapered carbon-fibre beam + foot pad oriented flat on the ground when deployed.
+    const pad = transformPart(frustum(0.5, 0.42, -0.08, 0.1, 24), M4.mul(M4.translate([0.08, 0, 6.25]), M4.rotAxis([0, 1, 0], 35 * Math.PI / 180)));
+    const leg = merge([taperedBox(0.95, 0.42, 0.42, 0.24, 6.2), transformPart(box(0.12, 0.7, 0.1, 0, 0, 0), M4.translate([0.12, 0, 0.3])), pad]);
     this.meshLeg = createMesh(gl, leg.d, leg.idx);
-    const strut = box(0.16, 0.16, 1.0, 0, 0, 0.5);
+    const strut = merge([frustum(0.12, 0.12, 0, 0.55, 12), frustum(0.08, 0.08, 0.55, 1.0, 12), frustum(0.14, 0.14, 0.5, 0.58, 12)]);
     this.meshStrut = createMesh(gl, strut.d, strut.idx);
-    const rcs = merge([0, 1, 2, 3].map((k) => transformPart(box(0.35, 0.35, 0.5, 1.58, 0, 17.3), M4.rotAxis([0, 0, 1], k * Math.PI / 2 + Math.PI / 4))));
+    const rcs = merge([0, 1, 2, 3].map((k) => transformPart(merge([box(0.35, 0.35, 0.5, 1.58, 0, 17.3), frustum(0.06, 0.08, 17.3, 17.42, 8)]), M4.rotAxis([0, 0, 1], k * Math.PI / 2 + Math.PI / 4))));
     this.meshRcs = createMesh(gl, rcs.d, rcs.idx);
-    const pole = merge([frustum(0.08, 0.08, 0, 6, 8), frustum(0.5, 0.15, 0, 2.6, 16, false)]);
     this.meshPole = createMesh(gl, frustum(0.08, 0.08, 0, 6, 8).d, frustum(0.08, 0.08, 0, 6, 8).idx);
     const sock = frustum(0.45, 0.14, 0, 2.6, 16, false);
     this.meshSock = createMesh(gl, sock.d, sock.idx);
-    const sph = frustum(0.5, 0.5, -0.5, 0.5, 12);
-    this.meshMarker = createMesh(gl, sph.d, sph.idx);
-    void pole;
   }
 
   // Static landing-zone furniture: pad-edge lights, floodlight masts, service
@@ -667,16 +527,19 @@ export class Scene {
     return out;
   }
 
-  // Pieces of the booster as (mesh, material, model matrix).
+
+  // Pieces of the booster as (mesh, material, model matrix, colour, glow).
   rocketParts(st) {
     const base = M4.fromQuatPos(st.q, st.pos);
+    const engineOn = st.throttle > 0.01 && st.state === "FLYING";
     const parts = [
-      [this.meshBody, 0, base], [this.meshFins, 3, base], [this.meshRcs, 1, base],
+      [this.meshBody, 0, base], [this.meshFins, 3, base], [this.meshRcs, 1, base, [0.08, 0.08, 0.085]],
+      [this.meshOuterBells, 10, base, null, 0], [this.meshEngineHW, 13, base, [0.14, 0.13, 0.12]],
     ];
     const [gx, gy] = [st.gimbal[0] * Math.PI / 180, st.gimbal[1] * Math.PI / 180];
     const pivot = M4.translate([0, 0, 0.3]), unpivot = M4.translate([0, 0, -0.3]);
     const g = M4.mul(M4.rotAxis([0, 1, 0], gy), M4.rotAxis([1, 0, 0], gx));
-    parts.push([this.meshBell, 2, M4.mul(base, M4.mul(pivot, M4.mul(g, unpivot)))]);
+    parts.push([this.meshBell, 10, M4.mul(base, M4.mul(pivot, M4.mul(g, unpivot))), null, engineOn ? 0.4 + 0.6 * st.throttle : 0]);
     const deploy = st.legs;
     const theta = (145 * Math.PI / 180) * deploy;
     for (let k = 0; k < 4; k++) {
@@ -692,66 +555,90 @@ export class Scene {
         const zaxis = V.norm(dir), ang = Math.acos(Math.max(-1, Math.min(1, zaxis[2])));
         const ax = V.cross([0, 0, 1], zaxis);
         const sm = M4.mul(M4.translate(anchor), M4.mul(V.len(ax) > 1e-6 ? M4.rotAxis(ax, ang) : M4.ident(), M4.scale([1, 1, len])));
-        parts.push([this.meshStrut, 2, M4.mul(base, sm)]);
+        parts.push([this.meshStrut, 2, M4.mul(base, sm), [0.62, 0.63, 0.65]]);
       }
     }
     return parts;
   }
 
   resize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const dpr = Math.min(window.devicePixelRatio || 1, 1);    // render at CSS resolution (MSAA covers edges)
     const w = Math.floor(this.canvas.clientWidth * dpr), h = Math.floor(this.canvas.clientHeight * dpr);
     if (this.canvas.width !== w || this.canvas.height !== h) { this.canvas.width = w; this.canvas.height = h; }
+  }
+
+  // Scene lights from the flame: l0 = luminous jet, l1 = impingement / wall jet.
+  _lights(P) {
+    if (!P.on) return { l0p: [0, 0, -1e4], l0c: [0, 0, 0], l1p: [0, 0, -1e4], l1c: [0, 0, 0] };
+    const I = P.intensity * (0.35 + 0.65 * P.pamb);
+    const s = Math.min(P.len * 0.22, Math.max(0.5, P.hdist * 0.5));
+    const l0p = V.add(P.exit, V.mul(P.axis, s));
+    const k0 = 110 * I;
+    const l0c = [1.0 * k0, 0.50 * k0, 0.17 * k0];
+    let l1p = [0, 0, -1e4], l1c = [0, 0, 0];
+    if (P.hit && P.heat > 0.003) {
+      l1p = [P.hit[0], P.hit[1], 1.2 + 0.3 * P.Rj];
+      const k1 = 110 * P.heat;
+      l1c = [1.0 * k1, 0.46 * k1, 0.14 * k1];
+    }
+    return { l0p, l0c, l1p, l1c };
   }
 
   // ---------------------------------------------------------------- render
   render(cam, st, fx, opts) {
     const gl = this.gl;
     this.resize();
-    this.time += 1 / 60;
     const W = this.canvas.width, H = this.canvas.height;
+    this._ensureTargets(W, H);
+    const T = this.targets;
     const proj = M4.perspective(cam.fov, W / H, 0.3, FAR);
     const view = M4.lookAt(cam.eye, cam.at, [0, 0, 1]);
     const vp = M4.mul(proj, view);
     this.vp = vp; this.proj = proj; this.viewM = view; this.W = W; this.H = H;
     this.invVP = M4.invert(vp); this.logFC = LOG_FC;
+    const camR = [view[0], view[4], view[8]], camU = [view[1], view[5], view[9]], camF = [-view[2], -view[6], -view[10]];
     const parts = this.rocketParts(st);
-    const engineOn = st.throttle > 0.01 && st.state === "FLYING";
-    const R = (v) => rot(st.q, v);
-    const exitPos = V.add(st.pos, R(V.add([0, 0, 0.3], this._thrustDirBody(st, -1.9))));
-    const plumeI = engineOn ? st.throttle : 0.0;
+    const P = fx.plume || plumeParams(st, this.time);
+    const Lt = this._lights(P);
 
     // ---- shadow pass (sun ortho around the booster)
     const focus = [st.pos[0], st.pos[1], Math.max(0, Math.min(st.pos[2], 60))];
     const sunEye = V.add(focus, V.mul(this.sun, 400));
     const sview = M4.lookAt(sunEye, focus, [0, 0, 1]);
-    const sproj = M4.ortho(-45, 45, -45, 45, 1, 1200);
+    const sproj = M4.ortho(-45, 45, -45, 45, 250, 560);
     const svp = M4.mul(sproj, sview);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.shadowFbo);
     gl.viewport(0, 0, this.shadowSize, this.shadowSize);
     gl.clear(gl.DEPTH_BUFFER_BIT);
     gl.enable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND);
     gl.useProgram(this.progDepth.program);
     gl.uniformMatrix4fv(this.progDepth.u.u_vp, false, svp);
     if (st.pos[2] < 400) for (const [mesh, , m] of parts) { gl.uniformMatrix4fv(this.progDepth.u.u_model, false, m); drawMesh(gl, mesh); }
     gl.uniformMatrix4fv(this.progDepth.u.u_model, false, M4.ident());
     for (const p of this.padProps) drawMesh(gl, p.mesh);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, W, H);
 
-    // ---- sky
+    // ---- opaque HDR pass (MSAA)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, T.msFbo);
+    gl.viewport(0, 0, W, H);
+    gl.depthMask(true);
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     gl.disable(gl.DEPTH_TEST);
     gl.useProgram(this.progSky.program);
-    gl.uniformMatrix4fv(this.progSky.u.u_invVP, false, M4.invert(vp));
+    gl.uniformMatrix4fv(this.progSky.u.u_invVP, false, this.invVP);
     gl.uniform3fv(this.progSky.u.u_cam, cam.eye);
     gl.uniform3fv(this.progSky.u.u_sun, this.sun);
     gl.uniform1f(this.progSky.u.u_alt, cam.eye[2]);
+    gl.bindVertexArray(this.emptyVao);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.enable(gl.DEPTH_TEST);
 
-    // ---- terrain
+    const setLights = (u) => {
+      gl.uniform3fv(u.u_l0Pos, Lt.l0p); gl.uniform3fv(u.u_l0Col, Lt.l0c);
+      gl.uniform3fv(u.u_l1Pos, Lt.l1p); gl.uniform3fv(u.u_l1Col, Lt.l1c);
+    };
+    // terrain
     const pt = this.progTerrain;
     gl.useProgram(pt.program);
     gl.uniformMatrix4fv(pt.u.u_vp, false, vp);
@@ -760,23 +647,26 @@ export class Scene {
     gl.uniform3fv(pt.u.u_sun, this.sun);
     gl.uniform1f(pt.u.u_alt, cam.eye[2]);
     gl.uniformMatrix4fv(pt.u.u_shadowVP, false, svp);
-    gl.uniform3fv(pt.u.u_plumePos, V.add(exitPos, [0, 0, -2]));
-    gl.uniform1f(pt.u.u_plumeI, plumeI * Math.max(0, 1 - exitPos[2] / 90));
+    setLights(pt.u);
+    gl.uniform3fv(pt.u.u_hit, P.hit || [0, 0, -1e4]);
+    gl.uniform1f(pt.u.u_Rw, P.Rw || 1);
+    gl.uniform1f(pt.u.u_heat, P.on && P.hit ? P.heat * P.intensity : 0);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.shadowTex);
     gl.uniform1i(pt.u.u_shadow, 0);
     drawMesh(gl, this.terrain);
 
-    // ---- booster + windsock + markers
+    // booster + props
     const pl = this.progLit;
     gl.useProgram(pl.program);
     gl.uniformMatrix4fv(pl.u.u_vp, false, vp);
     gl.uniform1f(pl.u.u_logFC, LOG_FC);
     gl.uniform3fv(pl.u.u_cam, cam.eye);
     gl.uniform3fv(pl.u.u_sun, this.sun);
-    gl.uniform3fv(pl.u.u_plumePos, exitPos);
-    gl.uniform1f(pl.u.u_plumeI, plumeI);
-    // Air-flow direction in the body frame for surface-pressure colouring.
+    gl.uniform1f(pl.u.u_alt, cam.eye[2]);
+    gl.uniformMatrix4fv(pl.u.u_shadowVP, false, svp);
+    gl.uniform1i(pl.u.u_shadow, 0);
+    setLights(pl.u);
     const vrel = V.sub(st.vel, st.wind);
     const sp = V.len(vrel);
     const flowW = sp > 0.5 ? V.mul(vrel, -1 / sp) : [0, 0, 1];
@@ -784,14 +674,15 @@ export class Scene {
     const flowB = [Rm[0] * flowW[0] + Rm[1] * flowW[1] + Rm[2] * flowW[2], Rm[4] * flowW[0] + Rm[5] * flowW[1] + Rm[6] * flowW[2], Rm[8] * flowW[0] + Rm[9] * flowW[1] + Rm[10] * flowW[2]];
     gl.uniform1i(pl.u.u_cpMode, 0);
     gl.uniform3fv(pl.u.u_flowB, flowB);
-    gl.uniform1f(pl.u.u_sinA, Math.sin((st.aero.alpha || 0) * Math.PI / 180));
-    const colors = { 1: [0.07, 0.075, 0.08], 2: [0.30, 0.31, 0.33], 3: [0.2, 0.2, 0.2], 4: [0.09, 0.09, 0.10] };
-    for (const [mesh, mat, m] of parts) {
+    gl.uniform1f(pl.u.u_sinA, Math.sin(((st.aero && st.aero.alpha) || 0) * Math.PI / 180));
+    for (const [mesh, mat, m, color, glow] of parts) {
       gl.uniform1i(pl.u.u_mat, mat);
-      gl.uniform3fv(pl.u.u_color, colors[mat] || [0.9, 0.9, 0.9]);
+      gl.uniform3fv(pl.u.u_color, color || [0.9, 0.9, 0.9]);
+      gl.uniform1f(pl.u.u_glow, glow || 0);
       gl.uniformMatrix4fv(pl.u.u_model, false, m);
       drawMesh(gl, mesh);
     }
+    gl.uniform1f(pl.u.u_glow, 0);
     // Windsock at the apron edge.
     const wind = st.wind, ws = Math.hypot(wind[0], wind[1]);
     const sockBase = [62, -18, 0];
@@ -801,68 +692,218 @@ export class Scene {
     const wdir = ws > 0.1 ? V.norm([wind[0], wind[1], 0]) : [1, 0, 0];
     const sockDir = V.norm(V.add(V.mul(wdir, droop), [0, 0, -(1 - droop)]));
     const sax = V.cross([0, 0, 1], sockDir), sang = Math.acos(Math.max(-1, Math.min(1, sockDir[2])));
-    gl.uniform1i(pl.u.u_mat, 9); gl.uniform3fv(pl.u.u_color, [1.0, 0.45, 0.1]);
+    gl.uniform1i(pl.u.u_mat, 1); gl.uniform3fv(pl.u.u_color, [0.95, 0.38, 0.08]);
     gl.uniformMatrix4fv(pl.u.u_model, false, M4.mul(M4.translate([sockBase[0], sockBase[1], 5.8]), V.len(sax) > 1e-6 ? M4.rotAxis(sax, sang) : M4.ident()));
     drawMesh(gl, this.meshSock);
-    // Landing-zone furniture (lights, masts, shed, tank, containers, cameras).
     this._drawPadProps(pl, this.time);
 
-    // ---- transparent: lines/ribbons, CFD slice, particles, plume
+    // lines + lamp glows (depth tested against the MSAA depth)
     gl.enable(gl.BLEND);
     gl.depthMask(false);
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     this._drawLines(fx.lines);
-    this._drawPoints(fx.points, false);
     this._drawPoints(this._padGlowPoints(this.time), true);
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.depthMask(true);
+    gl.disable(gl.BLEND);
+
+    // ---- resolve colour + depth
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, T.msFbo);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, T.resolveFbo);
+    gl.blitFramebuffer(0, 0, W, H, 0, 0, W, H, gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT, gl.NEAREST);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+
+    // ---- transparent volumetrics into the resolved colour (manual depth tests)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, T.transFbo);
+    this.outFbo = T.transFbo;
+    gl.viewport(0, 0, W, H);
+    gl.disable(gl.DEPTH_TEST);
+    gl.depthMask(false);
+    gl.enable(gl.BLEND);
     if (fx.fluid) {
       fx.fluid.draw(this, cam, fx.fluidMode, fx.fluidVolume);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, T.transFbo);
+      gl.viewport(0, 0, W, H);
+      gl.disable(gl.DEPTH_TEST);
       gl.depthMask(false);
       gl.enable(gl.BLEND);
     }
-    // Plume (additive).
-    if (engineOn) {
-      gl.blendFunc(gl.ONE, gl.ONE);
-      const pp = this.progPlume;
-      gl.useProgram(pp.program);
-      gl.uniformMatrix4fv(pp.u.u_vp, false, vp);
-      gl.uniform1f(pp.u.u_logFC, LOG_FC);
-      gl.uniform3fv(pp.u.u_cam, cam.eye);
-      gl.uniform1f(pp.u.u_time, this.time);
-      const dirW = R(this._thrustDirBody(st, -1));
-      const zaxis = V.norm(dirW), ang = Math.acos(Math.max(-1, Math.min(1, zaxis[2])));
-      const ax = V.cross([0, 0, 1], zaxis);
-      const model = M4.mul(M4.translate(exitPos), V.len(ax) > 1e-6 ? M4.rotAxis(ax, ang) : (zaxis[2] < 0 ? M4.rotAxis([1, 0, 0], Math.PI) : M4.ident()));
-      gl.uniformMatrix4fv(pp.u.u_model, false, model);
-      const pAmb = Math.exp(-st.pos[2] / 8400);
-      const L = (7 + 24 * st.throttle) * (1 + 1.6 * (1 - pAmb));
-      const expand = 0.25 + 3.2 * (1 - pAmb);
-      const layers = [
-        [0.95, 2.6 + expand, [1.0, 0.36, 0.08], [0.55, 0.12, 0.03], 0.55, 0],
-        [0.80, 1.4 + expand * 0.6, [1.0, 0.62, 0.22], [0.9, 0.3, 0.06], 0.8, 0],
-        [0.55, 0.55 + expand * 0.3, [1.0, 0.95, 0.75], [1.0, 0.6, 0.2], 1.0, 1],
-        [0.42, 0.2, [1.0, 1.0, 0.95], [1.0, 0.85, 0.5], 1.1, 1],
-      ];
-      for (const [r0, ex, c0, c1, it, dia] of layers) {
-        gl.uniform1f(pp.u.u_len, L * (dia ? 0.55 : 1.0));
-        gl.uniform1f(pp.u.u_r0, r0);
-        gl.uniform1f(pp.u.u_expand, ex);
-        gl.uniform3fv(pp.u.u_c0, c0);
-        gl.uniform3fv(pp.u.u_c1, c1);
-        gl.uniform1f(pp.u.u_int, it * (0.35 + 0.65 * st.throttle));
-        gl.uniform1f(pp.u.u_diamonds, dia * pAmb);
-        drawMesh(gl, this.plumeMesh);
-      }
-      this._drawPoints(fx.glow, true);
+    const partCtx = { camR, camU, camF, cam: cam.eye, Lt };
+    const pa = fx.particles;
+    if (pa && pa.n > 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.partBuf);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, pa.data, 0, Math.min(pa.n, this.partMax) * 12);
     }
-    gl.depthMask(true);
+    if (pa && pa.nFar > 0) this._drawParticles(0, pa.nFar, partCtx);
+    if (P.on) this._drawPlume(P, cam, camF);
+    if (pa && pa.n > pa.nFar) this._drawParticles(pa.nFar, Math.min(pa.n, this.partMax) - pa.nFar, partCtx);
+    if (fx.rcs && fx.rcs.length) this._drawRcs(fx.rcs, cam);
+
+    // ---- bloom + tone map
     gl.disable(gl.BLEND);
+    this._post();
+    gl.depthMask(true);
+    gl.enable(gl.DEPTH_TEST);
   }
 
-  _thrustDirBody(st, sign) {
-    const gx = st.gimbal[0] * Math.PI / 180, gy = st.gimbal[1] * Math.PI / 180;
-    const d = [Math.sin(gy), -Math.sin(gx) * Math.cos(gy), Math.cos(gx) * Math.cos(gy)];
-    return V.mul(d, sign);
+  _fullscreen() { this.gl.bindVertexArray(this.emptyVao); this.gl.drawArrays(this.gl.TRIANGLES, 0, 3); }
+
+  _drawPlume(P, cam, camF) {
+    const gl = this.gl, T = this.targets, pp = this.progPlume;
+    // Scissor to the projected bounds of the jet and the wall jet.
+    const pts = [];
+    const Rb = P.jetR(Math.min(P.len * 1.25, P.hdist)) * 2.2 + 1.5;
+    for (let i = 0; i <= 4; i++) {
+      const s = Math.min(P.len * 1.25, P.hdist + 1) * i / 4;
+      const c = V.add(P.exit, V.mul(P.axis, s));
+      for (const o of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) pts.push(V.add(c, V.mul(o, Rb + V.len(P.bend) * s * s)));
+    }
+    if (P.hit && P.heat > 0.002) {
+      const R = P.Rw * 2.6 + 2, Hh = 0.3 * P.Rj + 0.26 * P.Rw + 3;
+      for (let k = 0; k < 8; k++) { const a = k * Math.PI / 4; for (const z of [0, Hh]) pts.push([P.hit[0] + Math.cos(a) * R, P.hit[1] + Math.sin(a) * R, z]); }
+    }
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, behind = false;
+    for (const p of pts) {
+      const v = this.vp;
+      const x = v[0] * p[0] + v[4] * p[1] + v[8] * p[2] + v[12], y = v[1] * p[0] + v[5] * p[1] + v[9] * p[2] + v[13], w = v[3] * p[0] + v[7] * p[1] + v[11] * p[2] + v[15];
+      if (w <= 0.1) { behind = true; break; }
+      const sx = (x / w * 0.5 + 0.5) * T.W, sy = (y / w * 0.5 + 0.5) * T.H;
+      x0 = Math.min(x0, sx); x1 = Math.max(x1, sx); y0 = Math.min(y0, sy); y1 = Math.max(y1, sy);
+    }
+    if (behind) { x0 = 0; y0 = 0; x1 = T.W; y1 = T.H; }
+    x0 = Math.max(0, Math.floor(x0 / 2) - 2); y0 = Math.max(0, Math.floor(y0 / 2) - 2);
+    x1 = Math.min(T.PW, Math.ceil(x1 / 2) + 2); y1 = Math.min(T.PH, Math.ceil(y1 / 2) + 2);
+    if (x1 <= x0 || y1 <= y0) return;
+    // Ray-march at half resolution, then composite.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, T.plumeFbo);
+    gl.viewport(0, 0, T.PW, T.PH);
+    gl.disable(gl.BLEND);
+    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); gl.clearColor(0, 0, 0, 1);
+    gl.enable(gl.SCISSOR_TEST);
+    gl.scissor(x0, y0, x1 - x0, y1 - y0);
+    gl.useProgram(pp.program);
+    gl.uniformMatrix4fv(pp.u.u_invVP, false, this.invVP);
+    gl.uniform3fv(pp.u.u_cam, cam.eye);
+    gl.uniform3fv(pp.u.u_fwd, camF);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, T.depthTex); gl.uniform1i(pp.u.u_depth, 3);
+    gl.uniform1f(pp.u.u_logFar, Math.log2(FAR + 1));
+    gl.uniform3fv(pp.u.u_exit, P.exit);
+    gl.uniform3fv(pp.u.u_axis, P.axis);
+    gl.uniform3fv(pp.u.u_bend, P.bend);
+    gl.uniform1f(pp.u.u_len, P.len);
+    gl.uniform1f(pp.u.u_re, EXIT_R);
+    gl.uniform1f(pp.u.u_spread, P.spread);
+    gl.uniform1f(pp.u.u_bulge, P.bulge);
+    gl.uniform1f(pp.u.u_time, this.time % 1000);
+    gl.uniform1f(pp.u.u_I, P.intensity);
+    gl.uniform1f(pp.u.u_dia, P.diamonds);
+    gl.uniform1f(pp.u.u_lambda, P.lambda);
+    gl.uniform1f(pp.u.u_pamb, P.pamb);
+    gl.uniform1f(pp.u.u_hdist, P.hdist);
+    gl.uniform1f(pp.u.u_Rj, P.Rj || 1);
+    gl.uniform1f(pp.u.u_Rw, P.Rw || 1);
+    gl.uniform1f(pp.u.u_wall, P.hit ? P.heat * P.intensity : 0);
+    gl.uniform1f(pp.u.u_blast, P.blast);
+    gl.uniform3fv(pp.u.u_hit, P.hit || [0, 0, -1e4]);
+    gl.uniform1f(pp.u.u_dscale, T.W / T.PW);
+    this._fullscreen();
+    gl.disable(gl.SCISSOR_TEST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, T.transFbo);
+    gl.viewport(0, 0, T.W, T.H);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(this.progCopy.program);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, T.plumeTex);
+    gl.uniform1i(this.progCopy.u.u_src, 0);
+    this._fullscreen();
+    gl.activeTexture(gl.TEXTURE0);
+  }
+
+  _drawParticles(first, count, c) {
+    const gl = this.gl, T = this.targets, pp = this.progPart;
+    gl.useProgram(pp.program);
+    gl.uniformMatrix4fv(pp.u.u_vp, false, this.vp);
+    gl.uniform1f(pp.u.u_logFC, LOG_FC);
+    gl.uniform3fv(pp.u.u_camR, c.camR); gl.uniform3fv(pp.u.u_camU, c.camU); gl.uniform3fv(pp.u.u_camF, c.camF);
+    gl.uniform3fv(pp.u.u_cam, c.cam);
+    gl.uniform3fv(pp.u.u_sun, this.sun);
+    gl.uniform1f(pp.u.u_time, this.time % 1000);
+    gl.uniform3fv(pp.u.u_l0Pos, c.Lt.l0p); gl.uniform3fv(pp.u.u_l0Col, c.Lt.l0c);
+    gl.uniform3fv(pp.u.u_l1Pos, c.Lt.l1p); gl.uniform3fv(pp.u.u_l1Col, c.Lt.l1c);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, T.depthTex); gl.uniform1i(pp.u.u_depth, 3);
+    gl.uniform1f(pp.u.u_logFar, Math.log2(FAR + 1));
+    gl.bindVertexArray(this.partVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.partBuf);
+    for (let k = 0; k < 3; k++) gl.vertexAttribPointer(1 + k, 4, gl.FLOAT, false, 48, first * 48 + k * 16);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
+    gl.bindVertexArray(null);
+    gl.activeTexture(gl.TEXTURE0);
+  }
+
+  _drawRcs(jets, cam) {
+    const gl = this.gl, T = this.targets, pr = this.progRcs;
+    gl.useProgram(pr.program);
+    gl.uniformMatrix4fv(pr.u.u_vp, false, this.vp);
+    gl.uniform3fv(pr.u.u_cam, cam.eye);
+    gl.uniform3fv(pr.u.u_sun, this.sun);
+    gl.uniform1f(pr.u.u_time, this.time % 1000);
+    gl.uniform1f(pr.u.u_logFar, Math.log2(FAR + 1));
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, T.depthTex); gl.uniform1i(pr.u.u_depth, 3);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.enable(gl.CULL_FACE); gl.cullFace(gl.BACK);
+    for (const j of jets) {
+      const z = V.norm(j.dir), ang = Math.acos(Math.max(-1, Math.min(1, z[2]))), ax = V.cross([0, 0, 1], z);
+      const m = M4.mul(M4.translate(j.base), V.len(ax) > 1e-6 ? M4.rotAxis(ax, ang) : (z[2] < 0 ? M4.rotAxis([1, 0, 0], Math.PI) : M4.ident()));
+      gl.uniformMatrix4fv(pr.u.u_model, false, m);
+      gl.uniform1f(pr.u.u_len, j.len); gl.uniform1f(pr.u.u_r0, 0.05); gl.uniform1f(pr.u.u_r1, j.r1);
+      gl.uniform1f(pr.u.u_I, j.I); gl.uniform1f(pr.u.u_seed, j.seed);
+      drawMesh(gl, this.meshRcsJet);
+    }
+    gl.disable(gl.CULL_FACE);
+    gl.activeTexture(gl.TEXTURE0);
+  }
+
+  _post() {
+    const gl = this.gl, T = this.targets;
+    const B = T.bloom;
+    // downsample chain
+    gl.useProgram(this.progDown.program);
+    let src = T.colorTex, sw = T.W, sh = T.H;
+    for (let i = 0; i < B.length; i++) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, B[i].fbo);
+      gl.viewport(0, 0, B[i].w, B[i].h);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src);
+      gl.uniform1i(this.progDown.u.u_src, 0);
+      gl.uniform2f(this.progDown.u.u_texel, 1 / sw, 1 / sh);
+      gl.uniform1i(this.progDown.u.u_first, i === 0 ? 1 : 0);
+      this._fullscreen();
+      src = B[i].tex; sw = B[i].w; sh = B[i].h;
+    }
+    // upsample + accumulate
+    gl.useProgram(this.progUp.program);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    for (let i = B.length - 1; i > 0; i--) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, B[i - 1].fbo);
+      gl.viewport(0, 0, B[i - 1].w, B[i - 1].h);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, B[i].tex);
+      gl.uniform1i(this.progUp.u.u_src, 0);
+      gl.uniform2f(this.progUp.u.u_texel, 1 / B[i].w, 1 / B[i].h);
+      this._fullscreen();
+    }
+    gl.disable(gl.BLEND);
+    // composite
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, T.W, T.H);
+    const pc = this.progComp;
+    gl.useProgram(pc.program);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, T.colorTex); gl.uniform1i(pc.u.u_hdr, 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, B[0].tex); gl.uniform1i(pc.u.u_bloom, 1);
+    gl.uniform1f(pc.u.u_exposure, this.exposure);
+    gl.uniform1f(pc.u.u_bloomK, this.bloomK / Math.max(1, B.length) * 1.0);
+    gl.uniform1f(pc.u.u_time, this.time % 1000);
+    this._fullscreen();
+    gl.activeTexture(gl.TEXTURE0);
   }
 
   _drawPoints(list, additive) {
@@ -871,8 +912,7 @@ export class Scene {
     const n = Math.min(list.length, d.max);
     for (let i = 0; i < n; i++) {
       const p = list[i], o = i * 8;
-      d.data[o] = p[0]; d.data[o + 1] = p[1]; d.data[o + 2] = p[2];
-      d.data[o + 3] = p[3]; d.data[o + 4] = p[4]; d.data[o + 5] = p[5]; d.data[o + 6] = p[6]; d.data[o + 7] = p[7];
+      for (let k = 0; k < 8; k++) d.data[o + k] = p[k];
     }
     d.n = n;
     uploadDynamic(gl, d);
@@ -901,34 +941,6 @@ export class Scene {
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.bindVertexArray(d.vao);
     gl.drawArrays(gl.TRIANGLES, 0, n);
-  }
-
-  _drawSlice(st, flowW, opts) {
-    const gl = this.gl, m = this.cfdMeta;
-    // Plane through the booster containing the airflow and the body axis.
-    const axis = rot(st.q, [0, 0, 1]);
-    const e = m.tail_first ? axis : V.mul(axis, -1);
-    let ay = V.sub(e, V.mul(flowW, V.dot(e, flowW)));
-    if (V.len(ay) < 1e-3) ay = V.norm(V.cross(flowW, Math.abs(flowW[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0]));
-    ay = V.norm(ay);
-    const cell = 18.0 / (m.nx * 0.30);
-    const origin = V.add(st.pos, rot(st.q, [0, 0, 9.0]));
-    const ps = this.progSlice;
-    gl.useProgram(ps.program);
-    gl.uniformMatrix4fv(ps.u.u_vp, false, this.vp);
-    gl.uniform1f(ps.u.u_logFC, LOG_FC);
-    gl.uniform3fv(ps.u.u_origin, origin);
-    gl.uniform3fv(ps.u.u_ax, flowW);
-    gl.uniform3fv(ps.u.u_ay, ay);
-    gl.uniform2f(ps.u.u_size, m.nx * cell, m.ny * cell);
-    gl.uniform1i(ps.u.u_mode, opts.cfdField === "speed" ? 2 : 1);
-    gl.uniform1f(ps.u.u_alpha, 0.9);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.cfdTex); gl.uniform1i(ps.u.u_tex, 1);
-    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.solidTex); gl.uniform1i(ps.u.u_solid, 2);
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    gl.disable(gl.CULL_FACE);
-    drawMesh(gl, this.quad);
-    gl.activeTexture(gl.TEXTURE0);
   }
 
   project(p) {

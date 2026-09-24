@@ -25,7 +25,8 @@ thrust profile.  Drag d(t) is predicted along the previous plan.
 Autopilot (``Autopilot3D``)
 ---------------------------
 Coast engines-first -> (boost-back) -> single landing burn with a locked
-touchdown time -> terminal vertical descent -> engine cutoff on leg contact.
+touchdown time, planned by G-FOLD all the way to leg contact -> engine cutoff
+on leg contact.  There is no separate terminal-descent phase.
 Attitude: SO(3) error -> capped body-rate command -> angular acceleration ->
 2-axis TVC (pitch/yaw) + RCS (roll always, pitch/yaw at low thrust).
 """
@@ -58,9 +59,15 @@ class PlanConfig3D:
     max_tilt_deg: float = 60.0
     touchdown_speed: float = 1.0
     drag_model: Callable | None = None
-    target_alt: float = 0.0          # plan ends at the terminal gate above the pad
+    target_alt: float = 0.0          # plan end height above the pad (0 = touchdown)
     u_cmd: tuple | None = None       # previous plan's command now (continuity anchor)
     target_xy: tuple = (0.0, 0.0)    # gate position (normally the pad centre)
+    # Final-approach sink envelope (soft): sink <= touchdown_speed + sink_gain * h.
+    # Arrive slowly with thrust ~ weight instead of braking hard into contact.
+    sink_gain: float = 0.0
+    # Predicted altitude of each knot (from the previous plan: successive
+    # approximation, like the drag).  callable(times) -> heights, or None.
+    alt_ref: object = None
 
 
 @dataclass
@@ -124,6 +131,26 @@ class Planner3D:
     glide_slope_weight = 30.0
     glide_slope_tan = math.tan(math.radians(65.0))
     fuel_slack_weight = 2.0e4
+    sink_envelope_weight = 80.0
+    # Vertical final approach (SpaceX style): lateral offset and lateral
+    # speed get more expensive as touchdown approaches, so the divert is
+    # done early/high and the last seconds are flown (almost) vertically.
+    # Weights (per s) vs time-to-go (s).  Quadratic costs, not constraints:
+    # a hard corridor makes the burn fight the engines-first aerodynamics.
+    approach_t = (0.0, 6.0, 10.0, 15.0)
+    approach_pos_w = (3.0, 2.0, 0.2, 0.008)
+    approach_vel_w = (4.0, 3.0, 0.3, 0.03)
+    # Altitude-based vertical final approach (heights from the previous plan):
+    # thrust tilt limit vs predicted height, and lateral weights vs height.
+    vertical_h = (0.0, 200.0, 350.0)
+    vertical_tilt_deg = (3.0, 4.0, 90.0)
+    vertical_h_w = (0.0, 200.0, 300.0, 500.0)
+    vertical_pos_w = (3.0, 3.0, 0.5, 0.008)
+    vertical_vel_w = (4.0, 4.0, 0.6, 0.03)
+    # ... and in the last seconds, sideways thrust (= tilt) itself is costly:
+    # the final part of the descent is flown upright.
+    vertical_final_t = 5.0
+    vertical_final_w = 0.4
     lateral_position_weight = 0.008
     lateral_velocity_weight = 0.03
     lateral_jerk_factor = 8.0
@@ -168,7 +195,8 @@ class Planner3D:
         iem = iep + 6
         isg = iem + 6
         ifs = isg + N
-        n = ifs + 1
+        isk = ifs + 1                  # sink-envelope slacks, knots 1..N
+        n = isk + N
 
         def S(k, c):
             return NX * k + c
@@ -238,6 +266,14 @@ class Planner3D:
         for k in range(N):
             row([(isg + k, -1.0)], 0.0)
         row([(ifs, -1.0)], 0.0)
+        for k in range(N):
+            row([(isk + k, -1.0)], 0.0)
+        if cfg.sink_gain > 0.0:
+            # vz_k >= -(v_td + c (h_k - h_target)) - s_k   (linear in the state)
+            c_s = cfg.sink_gain
+            v_td = abs(cfg.touchdown_speed)
+            for k in range(1, N + 1):
+                row([(S(k, 5), -1.0), (S(k, 2), -c_s), (isk + k - 1, -1.0)], v_td - c_s * cfg.target_alt)
         for k in range(N + 1):
             # sigma <= mu2 (1 - z + z0)  ->  sigma + mu2 z <= mu2 (1 + z0)
             row([(U(k, 3), 1.0), (S(k, 6), mu2[k])], mu2[k] * (1.0 + z0[k]))
@@ -246,7 +282,14 @@ class Planner3D:
         # propellant: z_N >= ln(m_dry) - s_fuel
         row([(S(N, 6), -1.0), (ifs, -1.0)], -math.log(cfg.dry_mass))
         t_go = t_f - t_k
-        cos_tilt = np.cos(self._tilt_limit(t_go, cfg.max_tilt_deg))
+        tilt = self._tilt_limit(t_go, cfg.max_tilt_deg)
+        h_ref = None
+        if cfg.alt_ref is not None:
+            h_ref = np.maximum(0.0, np.asarray(cfg.alt_ref(t_k), float))
+            # SpaceX-style vertical final approach: knots predicted below
+            # ~200 m fly (almost) vertical thrust.
+            tilt = np.minimum(tilt, np.radians(np.interp(h_ref, self.vertical_h, self.vertical_tilt_deg)))
+        cos_tilt = np.cos(tilt)
         cos_tilt[0] = min(cos_tilt[0], math.cos(math.radians(80.0)))
         for k in range(N + 1):
             row([(U(k, 3), float(cos_tilt[k])), (U(k, 2), -1.0)], 0.0)
@@ -315,16 +358,29 @@ class Planner3D:
                 const += accel_w * w[k] * g * g
         # Horizontal distance from the pad axis: pulls lateral corrections
         # early, while the vehicle is high and tilting is cheap.
-        lat_w = 0.0 if cfg.mode == "fuel" else self.lateral_position_weight
-        if lat_w > 0.0:
+        if cfg.mode != "fuel":
+            tgo_k = t_f - t_k
+            wr = np.maximum(self.lateral_position_weight, np.interp(tgo_k, self.approach_t, self.approach_pos_w))
+            wvv = np.maximum(self.lateral_velocity_weight, np.interp(tgo_k, self.approach_t, self.approach_vel_w))
+            if h_ref is not None:
+                # Be over the pad, with no sideways speed, by ~200 m.
+                wr = np.maximum(wr, np.interp(h_ref, self.vertical_h_w, self.vertical_pos_w))
+                wvv = np.maximum(wvv, np.interp(h_ref, self.vertical_h_w, self.vertical_vel_w))
+            tx, ty = float(cfg.target_xy[0]), float(cfg.target_xy[1])
             for k in range(1, N + 1):
-                add_p(S(k, 0), S(k, 0), 2 * lat_w * w[k])
-                add_p(S(k, 1), S(k, 1), 2 * lat_w * w[k])
-                # Lateral speed, weighted up near touchdown: no fast sideways
-                # sweep across the pad at the end.
-                wv = self.lateral_velocity_weight * w[k] * (1.0 + 4.0 * k / N)
-                add_p(S(k, 3), S(k, 3), 2 * wv)
-                add_p(S(k, 4), S(k, 4), 2 * wv)
+                # (x - tx)^2 + (y - ty)^2, weighted up as touchdown approaches
+                for c_, t_ in ((0, tx), (1, ty)):
+                    add_p(S(k, c_), S(k, c_), 2 * wr[k] * w[k])
+                    q[S(k, c_)] += -2 * wr[k] * w[k] * t_
+                    const += wr[k] * w[k] * t_ * t_
+                # Lateral speed: no sideways sweep across the pad at the end.
+                add_p(S(k, 3), S(k, 3), 2 * wvv[k] * w[k])
+                add_p(S(k, 4), S(k, 4), 2 * wvv[k] * w[k])
+            for k in range(N + 1):
+                if tgo_k[k] < self.vertical_final_t:
+                    f = 1.0 - tgo_k[k] / self.vertical_final_t
+                    for c_ in (0, 1):
+                        add_p(U(k, c_), U(k, c_), 2 * self.vertical_final_w * f * w[k])
         jw = jerk_w / dt
         for k in range(N):
             for c in range(3):
@@ -351,6 +407,7 @@ class Planner3D:
             q[iem + c] = wgt
         q[isg:isg + N] = self.glide_slope_weight
         q[ifs] = self.fuel_slack_weight
+        q[isk:isk + N] = self.sink_envelope_weight
         for i in range(n):
             add_p(i, i, 1e-7)
         P = sparse.csc_matrix((pv, (pr, pc)), shape=(n, n))
@@ -438,7 +495,7 @@ class Planner3D:
 
 # ---------------------------------------------------------------- autopilot
 class Autopilot3D:
-    """Falcon-9 style recovery: coast -> (boost-back) -> one landing burn -> terminal.
+    """Falcon-9 style recovery: coast -> (boost-back) -> one landing burn to touchdown.
 
     * COAST: engine off, engines-first and aligned with the relative wind (the
       grid fins make that attitude aerodynamically stable).  A drag-aware
@@ -449,9 +506,11 @@ class Autopilot3D:
     * LANDING BURN: at ignition the touchdown time is locked and the 3-D
       G-FOLD SOCP (Planner3D) is re-solved every 0.2 s with a smooth
       objective; if the pad becomes unreachable the time moves to the
-      earliest reachable one (never simply later).
-    * TERMINAL: constant-deceleration vertical descent to 1.2 m/s, engine
-      cut-off on leg contact.
+      earliest reachable one (never simply later).  The plan ends on the pad
+      itself (base height 0, vertical, 1.2 m/s sink); the burn continues
+      until a foot touches and the engine is cut.  The last ~0.6 s are flown
+      on the final plan (no re-planning) with a tilt limit that tightens
+      with height, so the vehicle is upright at contact.
     """
 
     burn_replan_period = 0.2
@@ -461,17 +520,17 @@ class Autopilot3D:
     minimum_throttle = 0.20
     divert_tilt_deg = 65.0
     touchdown_speed = 1.2
-    gate_height = 4.0             # G-FOLD plan ends here, vertical, at gate_speed ...
-    gate_speed = 2.6              # ... then a short constant-deceleration final descent
-    terminal_height = 12.0
-    terminal_time_to_go = 2.0
-    terminal_max_tilt_deg = 10.0
-    contact_margin = 1.0          # first foot touches before the base reaches 0 m when tilted
+    gate_height = 0.0             # G-FOLD plan ends on the pad (base height 0) ...
+    gate_speed = 1.2              # ... vertical, at the touchdown sink rate
+    low_rcs_height = 15.0         # RCS assists TVC close to the ground
+    sink_gain = 0.5               # final approach: sink <= 1.2 + 0.5 h (m/s): 6.2 at 10 m, 2.2 at 2 m
+    sink_track_height = 15.0      # the tracker enforces the envelope below this height
     legs_deploy_height = 450.0
     boostback_miss = 350.0
     aero_steer_max_deg = 15.0
     lift_gradient_cap = 3.0       # body lift per radian of tilt, in units of thrust accel
     boostback_done_miss = 25.0
+    boostback_max_q = 15_000.0    # Pa: above this the booster cannot turn around for a boost-back
     # attitude loop
     k_angle = 2.0
     k_rate = 4.0
@@ -489,13 +548,13 @@ class Autopilot3D:
         self.next_predict = 0.0
         self.burn_locked = False
         self.touchdown_time: float | None = None
-        self.terminal_decel: float | None = None
         self.burn_fraction = self.burn_fraction_nominal
         self._failed = 0
         self._boostback = False
         self._boostback_done = False
+        self._bb_fired = False
+        self._vertical_mode = False
         self._touched = False
-        self._term_lat = None
         self._dir_prev = None
         self._gate_xy = np.zeros(2)
         self._dir_rate = np.zeros(3)
@@ -604,9 +663,15 @@ class Autopilot3D:
             # Low, short burns get a small tilt budget: a big lateral swing
             # close to the ground is exactly the "rocking" to avoid.
             # ... unless there is real sideways speed to kill (divert).
-            max_tilt_deg=float(max(np.interp(veh.altitude, [20.0, 120.0, 500.0], [6.0, 14.0, self.divert_tilt_deg]),
-                                   min(self.divert_tilt_deg, 2.0 * float(np.linalg.norm(veh.vel[:2]))))),
+            max_tilt_deg=float(min(
+                max(np.interp(veh.altitude, [20.0, 120.0, 500.0], [6.0, 14.0, self.divert_tilt_deg]),
+                    min(self.divert_tilt_deg, 2.0 * float(np.linalg.norm(veh.vel[:2])))),
+                # At high dynamic pressure a tilted engines-first booster makes
+                # body lift that nearly cancels the lateral thrust: big tilts
+                # there buy almost nothing and overshoot once q drops.
+                np.interp(float(veh.last.get("q", 0.0)), [1500.0, 4000.0, 9000.0], [45.0, 30.0, 20.0]))),
             touchdown_speed=self.gate_speed, target_alt=self.gate_height, target_xy=tuple(self._gate_xy),
+            sink_gain=self.sink_gain,
         )
 
     @staticmethod
@@ -627,18 +692,29 @@ class Autopilot3D:
             return 9.0, 1.0, np.array([0.0, 0.0, 1.0])
         a_v = max(0.1, (vz * vz - self.gate_speed ** 2) / (2.0 * h_eff))
         t_b = max(0.5, (-vz - self.gate_speed) / a_v)
-        a_lat = -(6.0 * r[:2] / t_b ** 2 + 4.0 * v[:2] / t_b) * 1.0
+        # Lateral need is spread over the whole time left to the gate (coast +
+        # burn), not over the vertical-only burn time, which collapses to ~0
+        # near the apex of a boost-back arc and makes the need blow up.
+        t_fall = (vz + math.sqrt(vz * vz + 2.0 * g * h_eff)) / g
+        t_lat = max(t_b, t_fall)
+        a_lat = -(6.0 * r[:2] / t_lat ** 2 + 4.0 * v[:2] / t_lat) * 1.0
         need = np.array([a_lat[0], a_lat[1], a_v + g - drag_up / 3.0])
         frac = m * float(np.linalg.norm(need)) / self._thrust_available(veh, r[2])
         return frac, t_b, need / float(np.linalg.norm(need))
 
-    def _ballistic(self, veh, r, v, m, wind_now, dt=0.25, t_max=240.0, stop_on_ignition=True):
-        """Drag-aware coast prediction. Returns (points, impact_xy, t_impact, t_ignition, burn_time)."""
+    def _ballistic(self, veh, r, v, m, wind_now, dt=0.25, t_max=900.0, stop_on_ignition=True):
+        """Drag-aware coast prediction. Returns (points, impact_xy, t_impact, t_ignition, burn_time).
+
+        Long enough for a coast from stage separation (apogee tens of km);
+        coarser steps high up where the air is thin."""
         pts = [r.copy()]
         p, u = r.copy(), v.copy()
         t = 0.0
         t_ign, t_burn = math.inf, math.inf
+        k_ign = 0
+        dt0 = dt
         while t < t_max:
+            dt = dt0 if p[2] < 12_000.0 else 4.0 * dt0
             rho, _, _, a = atmosphere(max(0.0, p[2]))
             f = self.aero.quick_force(u - wind_now, None, rho, a, 0.0) if self.aero is not None else np.zeros(3)
             if stop_on_ignition and not math.isfinite(t_ign):
@@ -646,19 +722,19 @@ class Autopilot3D:
                 if frac >= self.ignition_fraction:
                     t_ign, t_burn = t, tb
                     ign_p, ign_v = p.copy(), u.copy()
+                    k_ign = len(pts) - 1
             acc = f / m + np.array([0.0, 0.0, -G0])
             u = u + acc * dt
             p = p + u * dt
             t += dt
-            if len(pts) < 400:
+            if len(pts) < 1500:
                 pts.append(p.copy())
             if p[2] <= 0.0:
                 break
         impact = p[:2].copy()
         if math.isfinite(t_ign):
             # Visual prediction: coast until ignition, then a smooth arc to the pad.
-            k = int(t_ign / dt)
-            pts = pts[:k + 1]
+            pts = pts[:k_ign + 1]
             p0, v0 = ign_p, ign_v
             T = max(t_burn, 0.5)
             for s in np.linspace(0.0, 1.0, 30)[1:]:
@@ -675,6 +751,10 @@ class Autopilot3D:
         t_go = self.touchdown_time - self.elapsed
         cfg = self._config(veh, self.burn_fraction)
         cfg.drag_model = self._drag_model(veh, wind_now, t_go)
+        if self._vertical_mode and r[2] < self.planner.vertical_h[1] and (
+                float(np.linalg.norm(r[:2])) > 5.0 or float(np.linalg.norm(v[:2])) > 3.0):
+            self._vertical_mode = False       # not over the pad by 200 m: finish the divert normally
+        cfg.alt_ref = self._alt_ref(r[2], t_go) if self._vertical_mode else None
         plan = P.solve(r, v, m, t_go, cfg)
         if plan is None:
             self._failed += 1
@@ -692,6 +772,7 @@ class Autopilot3D:
                 self.burn_fraction = max(self.burn_fraction, frac)
                 cfg.thrust_max = self.burn_fraction * veh.spec.thrust_sl
                 cfg.drag_model = self._drag_model(veh, wind_now, t_new)
+                cfg.alt_ref = self._alt_ref(r[2], t_new) if self._vertical_mode else None
                 smooth = P.solve(r, v, m, t_new, cfg)
                 if smooth is not None:
                     plan = smooth
@@ -701,6 +782,21 @@ class Autopilot3D:
             self.plan = plan
             self.touchdown_time = self.elapsed + plan.t_f
             self.last_status = plan.status
+
+    def _alt_ref(self, h0, t_f):
+        """Predicted height along the burn: the previous plan, else a
+        constant-deceleration guess (h falls fast early, slowly late)."""
+        prev = self.plan if self.burn_locked else None
+        now = self.elapsed
+
+        def f(times):
+            times = np.asarray(times, float)
+            if prev is not None:
+                return np.array([prev.sample(now + t - prev.created_at)[0][2] for t in times])
+            s_ = np.clip(times / max(t_f, 0.5), 0.0, 1.0)
+            return h0 * (1.0 - s_) ** 2
+
+        return f
 
     def _earliest(self, r, v, m, cfg, t_go, veh):
         for frac in (self.burn_fraction, 0.92, 0.97):
@@ -762,7 +858,7 @@ class Autopilot3D:
         if veh.feet_contact > 0 or self._touched:
             self._touched = True
             c.throttle = 0.0
-            self.phase = "TERMINAL"
+            self.phase = "LANDING BURN"
             self._attitude(veh, np.array([0.0, 0.0, 1.0]), use_rcs=True)
             self._mark()
             return
@@ -775,27 +871,20 @@ class Autopilot3D:
             return
 
         t_go = self.touchdown_time - self.elapsed
-        # Hand-over to the final descent at the gate: no waiting, no hover.
-        if self.terminal_decel is None and (t_go <= 0.25 or h <= self.gate_height + 0.3):
-            self._start_terminal(veh, r, v, m)
-        terminal = self.terminal_decel is not None
-        if not terminal and self.planner.available and self.elapsed >= self.next_replan and t_go > 0.6:
+        # One burn all the way to leg contact: re-plan until the last ~0.6 s,
+        # then fly the final plan.  Past its end the plan's reference is
+        # "on the pad, sinking at touchdown speed", so a late vehicle keeps
+        # descending instead of hovering.
+        if self.planner.available and self.elapsed >= self.next_replan and t_go > 0.6:
             self._replan(veh, wind_now)
             self._publish()
             self.next_replan = self.elapsed + self.burn_replan_period
             t_go = self.touchdown_time - self.elapsed
-        self.time_to_go = t_go + (self._terminal_time if not terminal else 0.0)
+        self.time_to_go = max(0.0, t_go)
         if t_go < 8.0:
             c.legs_down = True
 
-        drag_now = veh.last["aero"] / m
-        if terminal:
-            self.phase = "TERMINAL"
-            accel = self._terminal_accel(veh, r, v, m, drag_now)
-            tilt_lim = float(np.interp(h, [0.3, 1.5, 3.0], [0.6, 2.0, 5.0]))   # upright at contact
-            max_tilt = math.radians(tilt_lim)
-            self.predicted_points = [(float(r[0]), float(r[1]), float(h)), (0.0, 0.0, 0.0)]
-        elif self.plan is not None:
+        if self.plan is not None:
             self.phase = "LANDING BURN"
             tau = self.elapsed - self.plan.created_at
             p_ref, v_ref, u_ff = self.plan.sample(tau)
@@ -804,7 +893,21 @@ class Autopilot3D:
             if nfb > 5.0:
                 fb *= 5.0 / nfb
             accel = u_ff + fb
-            max_tilt = math.radians(75.0)
+            if h < 10.0 and v[2] > -0.6 * self.touchdown_speed:
+                accel[2] = min(accel[2], 0.9 * g)     # never stall or climb above the pad
+            if h < self.sink_track_height:
+                # Final approach envelope (same as the planner's): if sinking
+                # faster than 1.2 + 0.5 h m/s, brake the excess.  Near the pad
+                # the sink rate settles at touchdown speed with thrust ~ weight,
+                # so cutting the engine at contact cannot bounce the vehicle.
+                v_lim = -(self.gate_speed + self.sink_gain * max(0.0, h))
+                if v[2] < v_lim:
+                    accel[2] += 2.0 * (v_lim - v[2])
+            # Tilt budget tightens with height: upright at contact.
+            if self._vertical_mode:
+                max_tilt = math.radians(float(np.interp(h, [0.3, 1.5, 3.0, 12.0, 200.0, 320.0], [0.6, 2.0, 4.0, 5.0, 6.0, 75.0])))
+            else:
+                max_tilt = math.radians(float(np.interp(h, [0.3, 1.5, 3.0, 12.0, 40.0], [0.6, 2.0, 5.0, 10.0, 75.0])))
         else:
             self.phase = "FALLBACK"
             a_max_now = s.thrust_sl / m
@@ -812,44 +915,7 @@ class Autopilot3D:
             accel = np.array([-0.08 * r[0] - 0.9 * v[0], -0.08 * r[1] - 0.9 * v[1], g + 1.5 * (vz_ref - v[2])])
             max_tilt = math.radians(35.0)
         self._mark()
-        self._fly_accel(veh, accel, max_tilt, floor=None if terminal else 0.9 * self.minimum_throttle)
-
-    @property
-    def _terminal_time(self):
-        return 2.0 * (self.gate_height - self.contact_margin) / (self.gate_speed + self.touchdown_speed)
-
-    def _start_terminal(self, veh, r, v, m):
-        s = veh.spec
-        h = max(r[2] - self.contact_margin, 0.3)
-        sink = max(0.0, -v[2])
-        need = (sink * sink - self.touchdown_speed ** 2) / (2.0 * h)
-        self.terminal_decel = float(np.clip(need, 0.0, 0.6 * (s.thrust_sl / m - G0)))
-
-    def _terminal_accel(self, veh, r, v, m, drag_now):
-        """Constant-deceleration vertical descent from the gate to leg contact.
-
-        The sink rate only ever decreases toward the touchdown speed (no
-        hover, no climbing); lateral velocity is damped to zero.
-        """
-        g = G0
-        h = r[2]
-        a_ref = self.terminal_decel
-        hh = max(0.0, h - self.contact_margin)
-        vz_ref = -math.sqrt(self.touchdown_speed ** 2 + 2.0 * a_ref * hh)
-        a_ff = a_ref if hh > 0.05 else 0.0
-        az = g - drag_now[2] + a_ff + 2.5 * (vz_ref - v[2])
-        az = float(np.clip(az, 0.4 * g, g + 2.0 * a_ref + 3.0))
-        if v[2] > -0.6 * self.touchdown_speed:
-            az = min(az, 0.9 * g)            # never stall above the pad
-        lat = -drag_now[:2] - 1.3 * v[:2] - 0.18 * r[:2]
-        # First-order filter (tau 0.5 s) so the thrust direction never jumps
-        # at the hand-over or when the lateral error changes sign.
-        if self._term_lat is None:
-            self._term_lat = np.asarray(self.cmd_accel[:2], float).copy()
-        a = min(1.0, self._dt / 0.5)
-        self._term_lat = self._term_lat + a * (lat - self._term_lat)
-        lat = self._term_lat
-        return np.array([lat[0], lat[1], az])
+        self._fly_accel(veh, accel, max_tilt, floor=0.9 * self.minimum_throttle if h > 1.0 else None)
 
     def _fly_accel(self, veh, accel, max_tilt, floor=None, align_gate=0.35):
         s = veh.spec
@@ -898,7 +964,7 @@ class Autopilot3D:
         self.cmd_axis = d
         c.throttle = thr
         attitude_control(veh, d, self.k_angle, self.k_rate, self.max_rate,
-                         veh.throttle < 0.25 or self.terminal_decel is not None, hold_roll=True)
+                         veh.throttle < 0.25 or veh.altitude < self.low_rcs_height, hold_roll=True)
 
     # ----------------------------------------------------- before ignition
     def _pre_ignition(self, veh, r, v, m, wind_now):
@@ -915,7 +981,12 @@ class Autopilot3D:
 
         # ---- boost-back: move the ballistic impact point onto the pad.
         airspeed = float(np.linalg.norm(v - wind_now))
-        if not self._boostback_done and (self._boostback or (miss > self.boostback_miss and r[2] > 1200.0 and airspeed < 180.0)):
+        rho_now = atmosphere(max(0.0, r[2]))[0]
+        q_now = 0.5 * rho_now * airspeed * airspeed
+        # Boost-back needs the vehicle to be able to turn around: low airspeed
+        # (low scenarios) or thin air (after stage separation, tens of km up).
+        can_turn = airspeed < 180.0 or q_now < self.boostback_max_q
+        if not self._boostback_done and (self._boostback or (miss > self.boostback_miss and r[2] > 1200.0 and can_turn)):
             self._boostback = True
             self.phase = "BOOSTBACK"
             self._mark()
@@ -924,15 +995,20 @@ class Autopilot3D:
             dv_h = -self.impact / t_fall
             dvn = float(np.linalg.norm(dv_h))
             self._best_miss = min(self._best_miss, miss)
-            if miss < self.boostback_done_miss or dvn < 0.4 or r[2] < 700.0 or miss > self._best_miss + 30.0:
+            diverging = self._bb_fired and miss > self._best_miss + 30.0   # only after thrust has acted
+            if miss < self.boostback_done_miss or dvn < 0.4 or r[2] < 700.0 or diverging:
                 self._boostback = False
                 self._boostback_done = True
             else:
                 d = np.array([dv_h[0], dv_h[1], 0.3 * dvn]) / dvn
                 d /= np.linalg.norm(d)
                 err = math.acos(max(-1.0, min(1.0, float(np.dot(veh.axis, d)))))
-                thr = float(np.clip(dvn / 8.0, 0.4, 0.9)) if err < math.radians(25.0) else 0.0
+                t_av = self._thrust_available(veh, r[2])
+                thr = float(np.clip(m * dvn / (2.0 * t_av), 0.08, 0.9)) if err < math.radians(25.0) else 0.0
                 c.throttle = thr
+                if thr > 0.0 and not self._bb_fired:
+                    self._bb_fired = True
+                    self._best_miss = miss      # divergence baseline starts when thrust starts
                 self.cmd_throttle = thr
                 self.cmd_axis = d
                 self.cmd_accel = d * thr * s.thrust_sl / m
@@ -1008,16 +1084,19 @@ class Autopilot3D:
 
     def _ignite(self, veh, r, v, m, wind_now, t_burn):
         self._dir_prev = veh.axis.copy()
-        # Very short burns (hover-slam from low altitude) cannot chase a small
-        # drift without a visible sideways swing: aim part-way and let the
-        # final descent take out the rest gently.
-        if t_burn < 5.0:
-            keep = float(np.clip((5.0 - t_burn) / 3.0, 0.0, 1.0)) * 0.6
-            proj = r[:2] + v[:2] * min(t_burn, 3.0) * 0.5
-            self._gate_xy = proj * keep if float(np.linalg.norm(proj)) < 6.0 else np.zeros(2)
+        self._gate_xy = np.zeros(2)          # the burn itself lands on the pad centre
+        # SpaceX-style vertical final approach (last ~200 m vertical) when the
+        # geometry allows it: ignition high enough, and the descent already
+        # steep (small sideways offset/speed relative to height/sink).  A low,
+        # slanted arrival (e.g. 1 km off from only 2 km up) cannot finish the
+        # divert above 200 m and uses the time-based approach instead.
+        above = max(1.0, r[2] - self.planner.vertical_h[1])
+        self._vertical_mode = bool(r[2] > 400.0
+                                   and float(np.linalg.norm(r[:2])) < 0.3 * above
+                                   and float(np.linalg.norm(v[:2])) < 0.3 * max(1.0, -float(v[2])))
         self.burn_locked = True
         self._boostback = False
-        self.touchdown_time = self.elapsed + max(1.5, 1.05 * t_burn)
+        self.touchdown_time = self.elapsed + max(1.5, 1.05 * t_burn) + 2.0   # + gentle final approach
         self.next_replan = self.elapsed
         self.plan = None
         self._replan(veh, wind_now)
@@ -1028,7 +1107,7 @@ class Autopilot3D:
         veh.controls.throttle = self.minimum_throttle
 
     def _mark(self):
-        if self.phase in ("COAST", "BOOSTBACK", "LANDING BURN", "TERMINAL", "LANDED") and self.phase not in self.visited:
+        if self.phase in ("COAST", "BOOSTBACK", "LANDING BURN", "LANDED") and self.phase not in self.visited:
             self.visited.append(self.phase)
 
     # ------------------------------------------------------------ attitude

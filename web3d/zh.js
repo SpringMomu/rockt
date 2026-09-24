@@ -15,6 +15,10 @@ export const SCENARIO = {
   "BOOSTBACK +1000 m / 100 m/s": "反推返航 · +1000 m · 100 m/s",
   "DIVERT -1000 m / 3-D": "三维偏置 · −1000 m",
   "ENTRY 12 km / 280 m/s": "12 km 再入 · 280 m/s",
+  "RTLS 30 km / 450 m/s": "返场 · 30 km 分离 · 450 m/s",
+  "RTLS 35 km / CROSSWIND": "返场 · 35 km 分离 · 强侧风",
+  "RTLS 30 km / LOW FUEL": "返场 · 30 km 分离 · 推进剂 3 t",
+  "RTLS 40 km / GUST + TUMBLE": "返场 · 40 km 分离 · 阵风 + 翻滚",
   "ON PAD - MANUAL": "发射台 · 手动",
 };
 
