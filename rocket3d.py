@@ -39,6 +39,20 @@ EARTH_RADIUS = 6_371_000.0
 
 
 # ---------------------------------------------------------------- math
+def cross3(a, b):
+    """np.cross for 3-vectors, same arithmetic without numpy's per-call overhead."""
+    a0, a1, a2 = a.tolist() if isinstance(a, np.ndarray) else a
+    b0, b1, b2 = b.tolist() if isinstance(b, np.ndarray) else b
+    return np.array([a1 * b2 - a2 * b1, a2 * b0 - a0 * b2, a0 * b1 - a1 * b0])
+
+
+def vnorm(x) -> float:
+    """np.linalg.norm for 1-D float vectors (same sqrt(x.x)), without the overhead."""
+    if isinstance(x, np.ndarray) and x.ndim == 1 and x.dtype == np.float64:
+        return math.sqrt(x.dot(x))
+    return float(np.linalg.norm(x))
+
+
 def quat_mul(a, b):
     aw, ax, ay, az = a
     bw, bx, by, bz = b
@@ -61,7 +75,7 @@ def quat_to_matrix(q):
 
 def quat_from_axis_angle(axis, angle):
     axis = np.asarray(axis, float)
-    n = np.linalg.norm(axis)
+    n = vnorm(axis)
     if n < 1e-12:
         return np.array([1.0, 0.0, 0.0, 0.0])
     axis = axis / n
@@ -71,17 +85,17 @@ def quat_from_axis_angle(axis, angle):
 
 def quat_between(u, v):
     """Shortest rotation taking unit vector u to unit vector v."""
-    u = np.asarray(u, float) / np.linalg.norm(u)
-    v = np.asarray(v, float) / np.linalg.norm(v)
+    u = np.asarray(u, float) / vnorm(u)
+    v = np.asarray(v, float) / vnorm(v)
     d = float(np.dot(u, v))
     if d < -0.999999:
-        axis = np.cross(u, [1.0, 0.0, 0.0])
-        if np.linalg.norm(axis) < 1e-6:
-            axis = np.cross(u, [0.0, 1.0, 0.0])
+        axis = cross3(u, [1.0, 0.0, 0.0])
+        if vnorm(axis) < 1e-6:
+            axis = cross3(u, [0.0, 1.0, 0.0])
         return quat_from_axis_angle(axis, math.pi)
-    c = np.cross(u, v)
+    c = cross3(u, v)
     q = np.array([1.0 + d, c[0], c[1], c[2]])
-    return q / np.linalg.norm(q)
+    return q / vnorm(q)
 
 
 # --------------------------------------------------------------- atmosphere
@@ -266,7 +280,7 @@ class Vehicle:
     def thrust_direction_body(self, gimbal=None) -> np.ndarray:
         gx, gy = self.gimbal if gimbal is None else gimbal
         d = np.array([math.sin(gy), -math.sin(gx) * math.cos(gy), math.cos(gx) * math.cos(gy)])
-        return d / np.linalg.norm(d)
+        return d / vnorm(d)
 
     def leg_foot_body(self, deploy: float):
         s = self.spec
@@ -327,7 +341,7 @@ class Vehicle:
         d_body = self.thrust_direction_body()
         f_thrust_b = d_body * thrust_mag
         r_gimbal = np.array([0.0, 0.0, s.gimbal_z - zc])
-        torque_b = np.cross(r_gimbal, f_thrust_b)
+        torque_b = cross3(r_gimbal, f_thrust_b)
         force_w = R @ f_thrust_b + np.array([0.0, 0.0, -m * g])
 
         # RCS.
@@ -374,11 +388,11 @@ class Vehicle:
         self.vel += acc * dt
         self.pos += self.vel * dt
         inertia = np.array([ixx, ixx, izz])
-        omega_dot = (torque_b - np.cross(self.omega, inertia * self.omega)) / inertia
+        omega_dot = (torque_b - cross3(self.omega, inertia * self.omega)) / inertia
         self.omega += omega_dot * dt
         dq = quat_mul(self.q, np.array([0.0, *self.omega])) * 0.5
         self.q = self.q + dq * dt
-        self.q /= np.linalg.norm(self.q)
+        self.q /= vnorm(self.q)
         self._consume(mdot, dt)
         self._store(R @ f_thrust_b, thrust_mag, mdot, isp, g, wind_v, v_rel, rho, a_snd, aero_info, m, zc)
         self._check_landed(dt)
@@ -412,7 +426,7 @@ class Vehicle:
             if depth <= 0.0:
                 continue
             r = pw - com
-            v = self.vel + np.cross(omega_w, r)
+            v = self.vel + cross3(omega_w, r)
             if is_foot:
                 self.feet_contact += 1
                 if self.touchdown is None and self.state == "FLYING":
@@ -420,18 +434,18 @@ class Vehicle:
                 if self.state == "FLYING" and v[2] < -7.0:
                     self._crash("LEG FAILURE (HARD LANDING)")
                     return np.zeros(3), np.zeros(3)
-            elif self.state == "FLYING" and (np.linalg.norm(v) > 2.5 or not is_foot and self.legs < 0.95):
+            elif self.state == "FLYING" and (vnorm(v) > 2.5 or not is_foot and self.legs < 0.95):
                 self._crash("HULL IMPACT" if self.legs >= 0.95 else "IMPACT - LEGS NOT DEPLOYED")
                 return np.zeros(3), np.zeros(3)
             fn = max(0.0, k * depth - c_d * v[2])
             vt = np.array([v[0], v[1], 0.0])
-            vt_n = np.linalg.norm(vt)
+            vt_n = vnorm(vt)
             ft = np.zeros(3)
             if vt_n > 1e-6:
                 ft = -vt / vt_n * min(mu * fn, 1.5e4 * vt_n)  # gain bounded for dt stability (yaw eff. mass)
             f = np.array([0.0, 0.0, fn]) + ft
             force += f
-            torque_b += R.T @ np.cross(r, f)
+            torque_b += R.T @ cross3(r, f)
         if self.feet_contact and self.state == "FLYING":
             tilt = math.degrees(math.acos(max(-1.0, min(1.0, self.axis[2]))))
             if tilt > 30.0:
@@ -451,7 +465,7 @@ class Vehicle:
         if self.state != "FLYING" or self.feet_contact < 3:
             self.settle_timer = 0.0
             return
-        if np.linalg.norm(self.vel) < 0.25 and np.linalg.norm(self.omega) < 0.06 and self.throttle < 0.05:
+        if vnorm(self.vel) < 0.25 and vnorm(self.omega) < 0.06 and self.throttle < 0.05:
             self.settle_timer += dt
             if self.settle_timer > 0.8:
                 self.state = "LANDED"
@@ -488,7 +502,7 @@ class Vehicle:
         heading = math.degrees(math.atan2(ax[0], ax[1])) % 360.0
         # Roll: rotation of body x about the axis relative to world north/east.
         bx = self.R[:, 0]
-        ref = np.cross(ax, [0.0, 0.0, 1.0]) if abs(ax[2]) < 0.999 else np.array([1.0, 0.0, 0.0])
-        ref = ref / (np.linalg.norm(ref) + 1e-12)
-        roll = math.degrees(math.atan2(np.dot(np.cross(ref, bx), ax), np.dot(ref, bx)))
+        ref = cross3(ax, [0.0, 0.0, 1.0]) if abs(ax[2]) < 0.999 else np.array([1.0, 0.0, 0.0])
+        ref = ref / (vnorm(ref) + 1e-12)
+        roll = math.degrees(math.atan2(np.dot(cross3(ref, bx), ax), np.dot(ref, bx)))
         return heading, pitch, roll

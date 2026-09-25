@@ -27,6 +27,8 @@ import time
 
 import numpy as np
 
+from rocket3d import cross3, vnorm
+
 
 # ------------------------------------------------------------ engineering
 def _transonic(mach: float, low: float, peak: float, high: float) -> float:
@@ -68,7 +70,7 @@ class AeroModel:
     def quick_force(self, v_rel, axis, rho, a_snd, legs=0.0):
         """Force only (no moments) for trajectory prediction in guidance."""
         s = self.spec
-        speed = float(np.linalg.norm(v_rel))
+        speed = float(vnorm(v_rel))
         if speed < 0.3 or rho <= 0.0:
             return np.zeros(3)
         u = v_rel / speed
@@ -81,7 +83,7 @@ class AeroModel:
         a_ref = math.pi * (s.diameter / 2) ** 2
         ca, cn_pot, cn_visc = self.coefficients(alpha, mach, c < 0.0)
         perp = u - c * axis
-        pn = float(np.linalg.norm(perp))
+        pn = float(vnorm(perp))
         f = -math.copysign(1.0, c) * q * a_ref * ca * axis
         fin_area = 3.2
         f += -math.copysign(1.0, c) * q * fin_area * 0.35 * abs(c) * axis
@@ -94,7 +96,7 @@ class AeroModel:
         s = self.spec
         R = vehicle.R
         axis = R[:, 2]
-        speed = float(np.linalg.norm(v_rel))
+        speed = float(vnorm(v_rel))
         _, zc, _, _ = vehicle.mass_properties()
         if speed < 0.3:
             self.last = {"mach": 0.0, "q": 0.0, "alpha": 0.0, "cp_z": zc, "drag": 0.0, "normal": 0.0,
@@ -129,7 +131,7 @@ class AeroModel:
         # Directions: axial force opposes the axial flow, normal force opposes
         # the crossflow.
         perp = u - c * axis
-        perp_n = float(np.linalg.norm(perp))
+        perp_n = float(vnorm(perp))
         f_axial = -math.copysign(1.0, c) * q * a_ref * ca * axis
         f_normal = np.zeros(3)
         n_dir = np.zeros(3)
@@ -157,7 +159,7 @@ class AeroModel:
         for f, zb in forces:
             r = R @ np.array([0.0, 0.0, zb - zc])
             total += f
-            moment += np.cross(r, f)
+            moment += cross3(r, f)
         # Aerodynamic damping (pitch/yaw from the long body + fins, roll from fins).
         omega_w = R @ vehicle.omega
         w_axial = float(np.dot(omega_w, axis))
@@ -165,13 +167,13 @@ class AeroModel:
         moment += -q * a_ref * s.length ** 2 * 3.0 * w_perp / max(speed, 5.0)
         moment += -q * fin_area * (s.diameter * 0.8) ** 2 * 1.2 * w_axial * axis / max(speed, 5.0)
 
-        normal_mag = float(np.linalg.norm(f_normal_pot + f_normal_visc + (f_fins - np.dot(f_fins, axis) * axis)))
+        normal_mag = float(vnorm(f_normal_pot + f_normal_visc + (f_fins - np.dot(f_fins, axis) * axis)))
         cp_z = zc
         if normal_mag > 1e-3:
             # Centre of pressure: where the normal force would act to give the
             # same moment about the CoM.
-            m_perp = np.linalg.norm(np.cross(axis, np.cross(moment, axis)))
-            sign = 1.0 if np.dot(np.cross(axis, -n_dir), moment) >= 0 else -1.0
+            m_perp = vnorm(cross3(axis, cross3(moment, axis)))
+            sign = 1.0 if np.dot(cross3(axis, -n_dir), moment) >= 0 else -1.0
             cp_z = zc + sign * m_perp / normal_mag
         drag = float(-np.dot(total, u))
         self.last = {"mach": mach, "q": q, "alpha": math.degrees(alpha), "tail_first": tail_first, "cp_z": cp_z,
@@ -214,5 +216,5 @@ class ExternalCFD:
                 return None
             c = self.c_world.copy()
         ca = float(-np.dot(c, axis))
-        cn = float(np.linalg.norm(c - np.dot(c, axis) * np.asarray(axis)))
+        cn = float(vnorm(c - np.dot(c, axis) * np.asarray(axis)))
         return ca, cn

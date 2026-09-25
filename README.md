@@ -157,3 +157,20 @@ python main3d.py --test     # 无窗口 3D 闭环回归：6 个场景
 .\native\build_solver.ps1
 cargo test --manifest-path native\Cargo.toml
 ```
+
+## 网页版（浏览器本地运行，公网部署）
+
+3D 仿真可以完全在玩家的浏览器里运行：服务器只下发静态文件，Web Worker 用 Pyodide（WebAssembly 版 CPython，
+自带 numpy / scipy / Clarabel）原样运行 rocket3d / aero3d / guidance3d / sim3d，没有任何网络往返。
+
+```bash
+python deploy/build_web.py            # 生成 dist/web3d/（约 31 MB，gzip 后约 20 MB；Pyodide 缓存在 .cache/）
+rsync -a --delete dist/web3d/ /var/www/rockt3d/
+cp deploy/nginx-rockt3d.conf /etc/nginx/sites-available/rockt3d.conf
+ln -sf /etc/nginx/sites-available/rockt3d.conf /etc/nginx/sites-enabled/ && nginx -t && systemctl reload nginx
+```
+
+前端启动时探测 `/api/scenarios`：由 `python main3d.py` 提供时走原来的服务器模式（原生速度），
+否则（静态部署）自动启动浏览器内仿真；`?local` 强制浏览器内仿真。
+浏览器内求解器是 Clarabel 的 Python/WASM 版，速度约为原生的 1/2：多数场景远快于实时，
+DIVERT 场景密集重规划时会短暂慢于实时（仿真放慢而非跳帧，与原生 Runner 一致）。

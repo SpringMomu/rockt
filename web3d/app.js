@@ -41,17 +41,41 @@ const CAM_NAMES = ["环绕", "着陆台", "侧视"];
 const VOL_NAMES = ["染料", "涡量", "速度"];
 const VOL_TO_TUNNEL = ["dye", "vort", "speed"];
 
-async function poll() {
-  try {
-    const r = await fetch("/api/state", { cache: "no-store" });
-    const st = await r.json();
-    buf.push({ t: performance.now(), st });
-    while (buf.length > 12) buf.shift();
-    latest = st; online = true;
-  } catch (e) { online = false; }
-  setTimeout(poll, 30);
+function receive(st) {
+  buf.push({ t: performance.now(), st });
+  while (buf.length > 12) buf.shift();
+  latest = st; online = true;
 }
-poll();
+
+// Where the simulation runs: the Python server (python main3d.py serves
+// /api) or, for the static web build, this browser (Pyodide in a worker).
+// ?local forces the in-browser simulator.
+const IN_BROWSER = /[?&]local/.test(location.search) || !(await fetch("/api/scenarios", { cache: "no-store" })
+  .then((r) => r.ok && (r.headers.get("Content-Type") || "").includes("json")).catch(() => false));
+let simWorker = null;
+if (IN_BROWSER) {
+  const note = document.createElement("div");
+  note.id = "simLoading";
+  note.style.cssText = "position:fixed;left:50%;top:42%;transform:translateX(-50%);z-index:50;padding:14px 22px;background:rgba(4,7,12,.88);color:#d8e6f2;border:1px solid rgba(120,170,210,.4);border-radius:6px;font:14px/1.5 sans-serif;text-align:center;pointer-events:none";
+  note.textContent = "正在启动本地仿真…";
+  document.body.appendChild(note);
+  simWorker = new Worker("sim_worker.js");
+  simWorker.onmessage = (ev) => {
+    const m = ev.data;
+    if (m.type === "state") receive(JSON.parse(m.json));
+    else if (m.type === "progress") { note.hidden = !m.text; note.textContent = m.text + "（首次加载约 30 MB，之后走浏览器缓存）"; }
+    else if (m.type === "error") { online = false; note.hidden = false; note.style.color = "#ff5a4e"; note.textContent = "本地仿真出错：" + m.text; }
+  };
+} else {
+  const poll = async () => {
+    try {
+      const r = await fetch("/api/state", { cache: "no-store" });
+      receive(await r.json());
+    } catch (e) { online = false; }
+    setTimeout(poll, 30);
+  };
+  poll();
+}
 
 // Interpolated state ~70 ms behind the newest sample (smooth at any poll jitter).
 function interpState(now) {
@@ -83,7 +107,8 @@ function send() {
   for (const k of Object.values(KEYMAP)) keys[k] = false;
   for (const [k, v] of Object.entries(held)) if (v && KEYMAP[k]) keys[KEYMAP[k]] = true;
   const actions = pending; pending = []; dirty = false;
-  fetch("/api/input", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keys, actions }) }).catch(() => {});
+  if (simWorker) simWorker.postMessage({ type: "input", keys, actions });
+  else fetch("/api/input", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keys, actions }) }).catch(() => {});
 }
 setInterval(() => { if (dirty || Object.values(held).some(Boolean)) send(); }, 100);
 function act(a) { pending.push(a); send(); }
@@ -432,7 +457,8 @@ function frame(now) {
         const fc = fluid.readForce(st);
         if (fc) {
           view.cfdCoef = fc;
-          fetch("/api/cfd3d", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ c_world: fc.world, cn: fc.cn, ca: fc.ca, zcp: fc.zcp, t: st.t }) }).catch(() => {});
+          if (simWorker) simWorker.postMessage({ type: "cfd", c_world: fc.world });
+          else fetch("/api/cfd3d", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ c_world: fc.world, cn: fc.cn, ca: fc.ca, zcp: fc.zcp, t: st.t }) }).catch(() => {});
         }
       }
       if (frameNo % 3 === 1) {
