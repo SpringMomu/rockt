@@ -92,6 +92,11 @@ def run(sc, over=None, pert=None, t_max=400.0):
             axis_prev = veh.axis.copy()
             if veh.vel[2] > 0.5:
                 climb = max(climb, float(veh.vel[2]))
+            M["burn_vh_max"] = max(M.get("burn_vh_max", 0.0), float(np.hypot(*veh.vel[:2])))
+            if "h200_d" not in M and veh.altitude <= 200.0:
+                M["h200_d"] = float(np.hypot(*veh.pos[:2]))
+                M["h200_vh"] = float(np.hypot(*veh.vel[:2]))
+                M["h200_vz"] = float(veh.vel[2])
             if veh.altitude < 150 and abs(veh.vel[2]) < 3.0 and veh.altitude > 2.0:
                 lowslow += PHYSICS_DT
             p = ap.plan
@@ -128,7 +133,7 @@ def fmt(sc, M):
     return (f"{sc} {M['state'][:6]:6s} bbEnd={f('bb_end_miss',0):>5} ignMiss={f('ign_miss',0):>4} ignLine={f('ign_line',0):>4} ignD={f('ign_d',0):>4} "
             f"ignVh={f('ign_vh',0):>3} ignH={f('ign_alt',0):>5} {M.get('mode','-')[:4]} | burn={f('burn_s')}s tilt={f('max_tilt',0)} "
             f"tilt<200={f('max_tilt_low',0)} rate95={f('tilt_rate_p95',0)} jump={f('jump_max',0)}/{f('jump_mean',0)} "
-            f"ret={M['retimes']} climb={f('climb')} lowslow={f('lowslow')} | err={f('err')} vh={f('vh',2)} vz={f('vz',2)} prop={f('prop',0)}")
+            f"ret={M['retimes']} climb={f('climb')} lowslow={f('lowslow')} | @200m d={f('h200_d',0)} vh={f('h200_vh',1)} vz={f('h200_vz',0)} burnVhMax={f('burn_vh_max',0)} | err={f('err')} vh={f('vh',2)} vz={f('vz',2)} prop={f('prop',0)}")
 
 
 if __name__ == "__main__":
