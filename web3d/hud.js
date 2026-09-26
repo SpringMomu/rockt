@@ -132,6 +132,11 @@ export class HUD {
     $("margin").textContent = (st.solver.margin * 100).toFixed(0) + " %";
     $("cmdThr").textContent = st.cmd_throttle === null ? "--" : (st.cmd_throttle * 100).toFixed(0) + " %";
     $("gimbal").textContent = `${st.gimbal[0].toFixed(1)} / ${st.gimbal[1].toFixed(1)}°`;
+    if (st.fins) {
+      const fd = st.fins.deploy;
+      $("fins").textContent = fd < 0.02 ? "收起" : fd < 0.98 ? `展开中 ${(fd * 100).toFixed(0)} %`
+        : st.fins.defl.map((d) => (d >= 0 ? "+" : "") + d.toFixed(0)).join(" ") + "°";
+    }
     $("att").textContent = `${st.heading.toFixed(0)}° / ${st.pitch.toFixed(1)}° / ${st.roll.toFixed(0)}°`;
     setLamp($("lAP"), st.autopilot ? "on" : "");
     setLamp($("lSAS"), st.sas !== "OFF" ? "cy" : "");

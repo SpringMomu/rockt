@@ -99,7 +99,17 @@ def run(sc, over=None, pert=None, t_max=400.0):
                 M["h200_vz"] = float(veh.vel[2])
             if veh.altitude < 150 and abs(veh.vel[2]) < 3.0 and veh.altitude > 2.0:
                 lowslow += PHYSICS_DT
-            p = ap.plan
+            sp = getattr(ap, "_scvx_plan", None)
+            if sp is not None and sp is not last_plan:
+                if last_plan is not None and hasattr(last_plan, "t0"):
+                    dev = 0.0
+                    t_a = max(sp.t0, last_plan.t0)
+                    t_b = min(sp.t0 + sp.t_f, last_plan.t0 + last_plan.t_f)
+                    for tt in np.linspace(t_a, max(t_a, t_b), 8):
+                        dev = max(dev, float(np.linalg.norm(sp.sample(tt)[0] - last_plan.sample(tt)[0])))
+                    plans.append(dev)
+                last_plan = sp
+            p = ap.plan if sp is None else None
             if p is not None and p is not last_plan:
                 if last_plan is not None:
                     dev = 0.0

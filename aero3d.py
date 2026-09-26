@@ -41,6 +41,88 @@ def _transonic(mach: float, low: float, peak: float, high: float) -> float:
     return high + (peak - high) * math.exp(-(mach - 1.1) / 0.6)
 
 
+def fin_normal_coeff(alpha: float, cn_alpha: float) -> float:
+    """Normal-force coefficient of one set of grid-fin cell walls.
+
+    Linear (cn_alpha) at small angles, peaking at 45 deg -- grid fins keep
+    working to large angles instead of stalling like a planar fin."""
+    return cn_alpha * math.sin(alpha) * math.cos(alpha)
+
+
+def fin_mach_factor(mach: float) -> float:
+    """Grid fins lose part of their effectiveness around Mach 1 (the cells
+    choke) and recover supersonically."""
+    return 1.0 - 0.35 * math.exp(-((mach - 1.05) / 0.22) ** 2)
+
+
+def grid_fin_forces(spec, R, zc, omega_b, v_rel_w, rho, a_snd, defl, deploy):
+    """Force and moment of the four grid fins.
+
+    Each panel sits at radius fin_r_cp and height grid_fin_z and is hinged
+    about its radial axis e_r.  The cells point along c = cos(d) e_z -
+    sin(d) e_t (d: deflection, e_t the tangential direction).  The local
+    air velocity relative to the panel (including the body rotation, which
+    gives the fins their damping) is split into components along the cells
+    and across them; each set of cell walls turns the crossflow back into
+    the cells and receives a force along the crossflow (lift), and the panel
+    has a drag along the air velocity.
+
+    Returns (force_world, moment_world_about_com, force_body_per_fin)."""
+    F_w = np.zeros(3)
+    M_w = np.zeros(3)
+    if deploy <= 0.01 or rho <= 0.0:
+        return F_w, M_w, None
+    Rt = R.T
+    v_b = Rt @ v_rel_w
+    zf = spec.grid_fin_z - zc
+    S = spec.fin_area * deploy
+    F_b = np.zeros(3)
+    M_b = np.zeros(3)
+    speed = float(np.linalg.norm(v_rel_w))
+    fM = fin_mach_factor(speed / max(a_snd, 1.0))
+    for i, az in enumerate(spec.fin_azimuth_deg):
+        ph = math.radians(az)
+        cph, sph = math.cos(ph), math.sin(ph)
+        e_r = np.array([cph, sph, 0.0])
+        e_t = np.array([-sph, cph, 0.0])
+        p_b = spec.fin_r_cp * e_r + np.array([0.0, 0.0, zf])
+        v_loc = v_b + cross3(omega_b, p_b)
+        w = -v_loc                                   # air velocity relative to the panel
+        w2 = float(np.dot(w, w))
+        if w2 < 1e-6:
+            continue
+        d = float(defl[i])
+        cd, sd = math.cos(d), math.sin(d)
+        c = np.array([0.0, 0.0, cd]) - sd * e_t      # cell axis
+        n_t = cd * e_t + np.array([0.0, 0.0, sd])    # across the cells, tangential walls
+        wc, wt, wr = float(np.dot(w, c)), float(np.dot(w, n_t)), float(np.dot(w, e_r))
+        q_loc = 0.5 * rho * w2
+        a_t = math.atan2(wt, abs(wc))
+        a_r = math.atan2(wr, abs(wc))
+        f = q_loc * S * (fM * (fin_normal_coeff(a_t, spec.fin_cn_alpha) * n_t
+                               + fin_normal_coeff(a_r, spec.fin_cn_alpha) * e_r)
+                         + spec.fin_cd0 * w / math.sqrt(w2))
+        F_b += f
+        M_b += cross3(p_b, f)
+    return R @ F_b, R @ M_b, F_b
+
+
+def fin_static_force(spec, u, axis, alpha, q, mach, deploy):
+    """Sum of the four grid fins at zero deflection (for trajectory
+    prediction, where the roll angle is unknown): identical to the per-fin
+    model for any roll angle at small angle of attack."""
+    if deploy <= 0.01:
+        return np.zeros(3)
+    c = float(np.dot(u, axis))
+    perp = u - c * axis
+    pn = float(np.linalg.norm(perp))
+    S = spec.fin_area * deploy
+    f = -u * q * 4.0 * S * spec.fin_cd0
+    if pn > 1e-9:
+        f += -(perp / pn) * q * 4.0 * S * fin_mach_factor(mach) * fin_normal_coeff(alpha, spec.fin_cn_alpha)
+    return f
+
+
 class AeroModel:
     """Forces and moments on the booster from the relative wind."""
 
@@ -67,7 +149,7 @@ class AeroModel:
         ca = ca0 * cabs * cabs
         return ca, cn_pot, cn_visc
 
-    def quick_force(self, v_rel, axis, rho, a_snd, legs=0.0):
+    def quick_force(self, v_rel, axis, rho, a_snd, legs=0.0, fins=1.0):
         """Force only (no moments) for trajectory prediction in guidance."""
         s = self.spec
         speed = float(vnorm(v_rel))
@@ -85,10 +167,9 @@ class AeroModel:
         perp = u - c * axis
         pn = float(vnorm(perp))
         f = -math.copysign(1.0, c) * q * a_ref * ca * axis
-        fin_area = 3.2
-        f += -math.copysign(1.0, c) * q * fin_area * 0.35 * abs(c) * axis
         if pn > 1e-6:
-            f += -(perp / pn) * q * (a_ref * (cn_pot + cn_visc) + fin_area * 1.6 * math.sin(alpha))
+            f += -(perp / pn) * q * a_ref * (cn_pot + cn_visc)
+        f += fin_static_force(s, u, axis, alpha, q, mach, fins)
         f += -u * q * 4.0 * legs * 0.9
         return f
 
@@ -144,28 +225,32 @@ class AeroModel:
         z_lead = 0.0 if tail_first else s.length  # potential lift sits at the leading end
         z_mid = s.length * 0.5
 
-        # Grid fins (at the top): lift against the local crossflow; they add
-        # drag and a strong restoring moment when falling engine-first.
-        fin_area = 3.2
-        fin_cn = 1.6 * math.sin(alpha) * (1.0 if tail_first else 0.6)
-        f_fins = -n_dir * q * fin_area * fin_cn - math.copysign(1.0, c) * q * fin_area * 0.35 * abs(c) * axis
         # Deployed legs add drag near the base.
         leg_area = 4.0 * vehicle.legs
         f_legs = -u * q * leg_area * 0.9
 
-        forces = [(f_axial, z_mid), (f_normal_pot, z_lead), (f_normal_visc, z_mid), (f_fins, s.grid_fin_z), (f_legs, 2.0)]
+        forces = [(f_axial, z_mid), (f_normal_pot, z_lead), (f_normal_visc, z_mid), (f_legs, 2.0)]
         total = np.zeros(3)
         moment = np.zeros(3)
         for f, zb in forces:
             r = R @ np.array([0.0, 0.0, zb - zc])
             total += f
             moment += cross3(r, f)
-        # Aerodynamic damping (pitch/yaw from the long body + fins, roll from fins).
+        # Body aerodynamic damping (pitch/yaw of the long body).  The grid
+        # fins' damping comes from their own model (local flow includes the
+        # rotation).
         omega_w = R @ vehicle.omega
         w_axial = float(np.dot(omega_w, axis))
         w_perp = omega_w - w_axial * axis
-        moment += -q * a_ref * s.length ** 2 * 3.0 * w_perp / max(speed, 5.0)
-        moment += -q * fin_area * (s.diameter * 0.8) ** 2 * 1.2 * w_axial * axis / max(speed, 5.0)
+        moment += -q * a_ref * s.length ** 2 * 2.2 * w_perp / max(speed, 5.0)
+        moment += -q * 1.0 * (s.diameter * 0.8) ** 2 * 0.4 * w_axial * axis / max(speed, 5.0)
+        moment_body = moment.copy()
+        # Grid fins: four hinged lattice panels (deflection = control).
+        f_fins, m_fins, _ = grid_fin_forces(s, R, zc, vehicle.omega, v_rel, rho, a_snd,
+                                            getattr(vehicle, "fin_defl", np.zeros(4)),
+                                            float(getattr(vehicle, "fins_deploy", 1.0)))
+        total += f_fins
+        moment += m_fins
 
         normal_mag = float(vnorm(f_normal_pot + f_normal_visc + (f_fins - np.dot(f_fins, axis) * axis)))
         cp_z = zc
@@ -178,7 +263,8 @@ class AeroModel:
         drag = float(-np.dot(total, u))
         self.last = {"mach": mach, "q": q, "alpha": math.degrees(alpha), "tail_first": tail_first, "cp_z": cp_z,
                      "com_z": zc, "drag": drag, "normal": normal_mag, "ca": ca, "cn": cn_pot + cn_visc,
-                     "source": source, "force": total, "n_dir": n_dir}
+                     "source": source, "force": total, "n_dir": n_dir,
+                     "force_fins": f_fins, "moment_fins": m_fins, "moment_body": moment_body}
         return total, moment, self.last
 
 

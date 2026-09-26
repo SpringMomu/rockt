@@ -20,28 +20,12 @@ SCENARIOS = [
     {"name": "HOVER-SLAM 100 m", "pos": (0, 0, 100), "vel": (0, 0, 0), "tilt": 0.0, "prop": 2500},
     {"name": "2000 m / +30 m/s UP", "pos": (0, 0, 2000), "vel": (0, 0, 30), "tilt": 0.0, "prop": 4000},
     {"name": "2000 m / -30 m/s DOWN", "pos": (0, 0, 2000), "vel": (0, 0, -30), "tilt": 0.0, "prop": 4000},
-    {"name": "BOOSTBACK +1000 m / 100 m/s", "pos": (1000, 300, 2000), "vel": (100, -20, 0), "tilt": 10.0, "prop": 5500},
-    {"name": "DIVERT -1000 m / 3-D", "pos": (-1000, 600, 2000), "vel": (100, -40, 0), "tilt": 10.0, "prop": 5500},
+    {"name": "BOOSTBACK +1000 m / 100 m/s", "pos": (1000, 300, 2000), "vel": (100, -20, 0), "tilt": 10.0, "prop": 5500,
+     "fins_stowed": True},
+    {"name": "DIVERT -1000 m / 3-D", "pos": (-1000, 600, 2000), "vel": (100, -40, 0), "tilt": 10.0, "prop": 5500,
+     "fins_stowed": True},
     {"name": "ENTRY 12 km / 280 m/s", "pos": (1800, -1100, 12000), "vel": (-88, 54, -260), "tilt": 8.0, "prop": 6000},
-    # ---- return to launch site from stage separation (keys 7, 8, 9, 0) ------
-    # Full Falcon-9 style sequence: the booster starts nose-first, still
-    # climbing and flying AWAY from the pad; it flips, boosts back (in thin
-    # air), coasts over the apogee and re-enters engines-first, steers the
-    # impact point with body lift, then lights one landing burn.
-    # "axis": initial body axis (world), here along the velocity (prograde).
-    # Checked once each (engineering aero, no CFD): boost-back 33-38 s, apogee
-    # 37-51 km, re-entry max-q 19-40 kPa; landed 0.07-0.9 m from the centre.
-    # LOW FUEL lands with ~0.8 t left (about one landing burn of margin).
-    {"name": "RTLS 30 km / 450 m/s", "pos": (6000, 0, 30000), "vel": (300, 0, 330), "axis": (300, 0, 330),
-     "prop": 7000},
-    {"name": "RTLS 35 km / CROSSWIND", "pos": (8000, -2500, 35000), "vel": (340, -90, 360), "axis": (340, -90, 360),
-     "prop": 7500, "wind": (12.0, 45.0, 3.5)},
-    {"name": "RTLS 30 km / LOW FUEL", "pos": (6000, 1500, 30000), "vel": (300, 60, 330), "axis": (300, 60, 330),
-     "prop": 3000},
-    {"name": "RTLS 40 km / GUST + TUMBLE", "pos": (9000, 3000, 40000), "vel": (380, 120, 380), "axis": (380, 120, 330),
-     "prop": 8000, "wind": (15.0, 250.0, 5.0), "omega": (0.08, -0.05, 0.2)},
 ]
-DEFAULT_WIND = (6.0, 90.0, 1.8)   # speed at 10 m (m/s), heading blown toward (deg), gust (m/s)
 
 
 class Sim3D:
@@ -70,19 +54,17 @@ class Sim3D:
     def load_scenario(self, index: int, autopilot: bool = True) -> None:
         with self.lock:
             sc = SCENARIOS[index % len(SCENARIOS)]
-            tilt = math.radians(sc.get("tilt", 0.0))
+            tilt = math.radians(sc["tilt"])
             vel = np.array(sc["vel"], float)
             horiz = np.array([vel[0], vel[1], 0.0])
             axis = np.array([0.0, 1.0, 0.0]) if np.linalg.norm(horiz) < 1e-6 else np.cross([0.0, 0.0, 1.0], horiz / np.linalg.norm(horiz))
             q = quat_from_axis_angle(axis, -tilt)
-            if "axis" in sc:
-                q = quat_between(np.array([0.0, 0.0, 1.0]), np.array(sc["axis"], float))
             self.vehicle.reset(position=sc["pos"], velocity=sc["vel"], attitude=q, propellant=sc["prop"], on_pad=False)
             self.vehicle.pos[2] += self.vehicle._rest_height()
-            if "omega" in sc:
-                self.vehicle.omega = np.array(sc["omega"], float)
-            ws, wh, wg = sc.get("wind", DEFAULT_WIND)
-            self.wind.speed_10m, self.wind.heading_deg, self.wind.gust = float(ws), float(wh), float(wg)
+            if sc.get("fins_stowed", False):
+                # before a boost-back: grid fins still stowed (deployed after it)
+                self.vehicle.fins_deploy = 0.0
+                self.vehicle.controls.fins_deploy = False
             self.autopilot.reset()
             self.autopilot_on = autopilot
             self.sas = "OFF"

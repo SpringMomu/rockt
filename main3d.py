@@ -76,6 +76,8 @@ def snapshot(sim: Sim3D) -> dict:
             "cmd_axis": _vec(ap.cmd_axis) if sim.autopilot_on else None,
             "gimbal": _vec(np.degrees(v.gimbal)), "gimbal_limit": math.degrees(s.gimbal_limit), "rcs": _vec(v.rcs),
             "legs": round(v.legs, 3), "legs_cmd": v.controls.legs_down, "feet": v.feet_contact,
+            "fins": {"defl": [round(float(math.degrees(x)), 2) for x in getattr(v, "fin_defl", np.zeros(4))],
+                     "deploy": round(float(getattr(v, "fins_deploy", 1.0)), 3)},
             "fuel": {"lox": round(v.lox, 1), "rp1": round(v.rp1, 1), "lox_cap": s.lox_capacity, "rp1_cap": s.rp1_capacity,
                      "mass": round(m, 1), "dry": s.dry_mass, "mdot": round(mdot, 2), "isp": round(float(v.last.get("isp", s.isp_sl)), 1),
                      "dv": round(v.delta_v_remaining(p), 1), "burn_left": None if not math.isfinite(burn_left) else round(burn_left, 1),

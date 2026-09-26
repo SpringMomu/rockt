@@ -98,6 +98,20 @@ def quat_between(u, v):
     return q / vnorm(q)
 
 
+def fin_mix(cmd):
+    """(pitch, yaw, roll) command -> deflection of the fins at 0/90/180/270 deg.
+
+    With the flow coming from the engine end (engines-first descent) a
+    positive deflection makes a panel push along its tangential direction;
+    pitch (body x) uses the 0/180 pair differentially, yaw (body y) the
+    90/270 pair, roll all four together.  The attitude controller does not
+    rely on these signs: it measures the fins' effectiveness on the aero
+    model at the current flow (which also covers nose-first flow, where the
+    signs reverse)."""
+    p, y, r = float(cmd[0]), float(cmd[1]), float(cmd[2])
+    return np.array([-p + r, -y + r, p + r, y + r])
+
+
 # --------------------------------------------------------------- atmosphere
 def atmosphere(h: float):
     """ISA: returns (density kg/m3, pressure Pa, temperature K, speed of sound m/s)."""
@@ -154,10 +168,21 @@ class VehicleSpec:
     nozzle_exit_z: float = -1.6
     rcs_torque: tuple = (60_000.0, 60_000.0, 22_000.0)  # pitch(x), yaw(y), roll(z) N*m
     rcs_z: float = 17.2
-    # Grid-fin control moment per unit dynamic pressure at full deflection
-    # (4 fins x 0.8 m2 x CL 0.8 x ~10.5 m lever; roll ~2.5 m arm).
-    fin_moment: tuple = (27.0, 27.0, 6.4)
-    fin_rate: float = 3.0            # full-scale deflections per second
+    # Grid fins: four lattice panels at the top of the booster (azimuths
+    # 0/90/180/270 deg in the body frame), each hinged about its radial
+    # axis.  The flow passes through the cells; deflecting a panel turns
+    # the cells against the flow and the panel produces a force in the
+    # tangential direction (and a moment about the centre of mass).  See
+    # aero3d.grid_fin_forces.
+    fin_azimuth_deg: tuple = (0.0, 90.0, 180.0, 270.0)
+    fin_area: float = 1.62           # panel area (1.35 m span x 1.2 m)
+    fin_cn_alpha: float = 0.80       # normal-force slope per cell-wall set (1/rad, on fin_area)
+    fin_cd0: float = 0.30            # panel drag (on fin_area)
+    fin_r_cp: float = 2.17           # radial position of the panel centre
+    fin_max_defl: float = math.radians(20.0)
+    fin_rate: float = math.radians(40.0)   # deflection rate limit (rad/s)
+    fin_deploy_time: float = 1.5
+    fin_moment: tuple = (19.0, 19.0, 5.0)  # rough full-deflection moment per Pa (only for legacy code)
     tank_bottom: float = 2.0
     tank_top: float = 15.5
     dry_com_z: float = 7.0
@@ -185,7 +210,8 @@ class Controls:
     throttle: float = 0.0            # commanded 0..1
     gimbal: tuple = (0.0, 0.0)       # commanded (about body x, about body y), rad
     rcs: tuple = (0.0, 0.0, 0.0)     # -1..1 per axis (pitch x, yaw y, roll z)
-    fins: tuple = (0.0, 0.0, 0.0)    # grid-fin deflection -1..1 per axis (pitch, yaw, roll)
+    fins: tuple = (0.0, 0.0, 0.0)    # grid-fin command -1..1 per axis (pitch, yaw, roll), mixed onto the 4 fins
+    fins_deploy: bool = True         # grid fins out (they are stowed for ascent / boost-back)
     legs_down: bool = False
 
 
@@ -210,9 +236,11 @@ class Vehicle:
         self.throttle = 0.0
         self.gimbal = np.zeros(2)
         self.rcs = np.zeros(3)
-        self.fins = np.zeros(3)
+        self.fins = np.zeros(3)          # last (pitch, yaw, roll) fin command actually mixed
+        self.fin_defl = np.zeros(4)      # actual deflection of each panel (rad)
+        self.fins_deploy = 0.0 if on_pad else 1.0
         self.legs = 1.0 if on_pad else 0.0
-        self.controls = Controls(legs_down=on_pad)
+        self.controls = Controls(legs_down=on_pad, fins_deploy=not on_pad)
         self.state = "ON PAD" if on_pad else "FLYING"
         self.crash_reason = ""
         self.touchdown: dict | None = None
@@ -325,7 +353,12 @@ class Vehicle:
         self.gimbal += np.clip(g_cmd - self.gimbal, -s.gimbal_rate * dt, s.gimbal_rate * dt)
         self.rcs = np.clip(np.asarray(c.rcs, float), -1.0, 1.0)
         f_cmd = np.clip(np.asarray(c.fins, float), -1.0, 1.0)
-        self.fins += np.clip(f_cmd - self.fins, -s.fin_rate * dt, s.fin_rate * dt)
+        self.fins = f_cmd
+        d_cmd = fin_mix(f_cmd) * s.fin_max_defl if c.fins_deploy else np.zeros(4)
+        d_cmd = np.clip(d_cmd, -s.fin_max_defl, s.fin_max_defl)
+        self.fin_defl += np.clip(d_cmd - self.fin_defl, -s.fin_rate * dt, s.fin_rate * dt)
+        target_fins = 1.0 if c.fins_deploy else 0.0
+        self.fins_deploy += max(-dt / s.fin_deploy_time, min(dt / s.fin_deploy_time, target_fins - self.fins_deploy))
         target_legs = 1.0 if c.legs_down else 0.0
         self.legs += max(-dt / s.leg_deploy_time, min(dt / s.leg_deploy_time, target_legs - self.legs))
 
@@ -357,9 +390,7 @@ class Vehicle:
             torque_b = torque_b + R.T @ m_aero
             self.last["aero"] = f_aero
             self.last["aero_moment"] = m_aero
-            # Grid-fin steering moment (body frame), proportional to dynamic pressure.
             q_dyn = 0.5 * rho * float(np.dot(v_rel, v_rel))
-            torque_b = torque_b + self.fins * q_dyn * np.array(s.fin_moment)
             self.last["q"] = q_dyn
         else:
             self.last["aero"] = np.zeros(3)

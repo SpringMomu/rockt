@@ -93,6 +93,8 @@ function interpState(now) {
     pos: V.lerp(A.pos, B.pos, f), vel: V.lerp(A.vel, B.vel, f), q: slerp(A.q, B.q, f),
     throttle: A.throttle + (B.throttle - A.throttle) * f, legs: A.legs + (B.legs - A.legs) * f,
     gimbal: [A.gimbal[0] + (B.gimbal[0] - A.gimbal[0]) * f, A.gimbal[1] + (B.gimbal[1] - A.gimbal[1]) * f, 0],
+    fins: (A.fins && B.fins) ? { deploy: A.fins.deploy + (B.fins.deploy - A.fins.deploy) * f,
+      defl: B.fins.defl.map((d, k) => A.fins.defl[k] + (d - A.fins.defl[k]) * f) } : B.fins,
     alt: A.alt + (B.alt - A.alt) * f, t: A.t + (B.t - A.t) * f,
   });
 }

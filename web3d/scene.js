@@ -305,9 +305,12 @@ export class Scene {
     hw.push(frustum(0.2, 0.16, -0.22, 0.3, 16));                            // centre engine chamber
     const om = merge(outer); this.meshOuterBells = createMesh(gl, om.d, om.idx);
     const hm = merge(hw); this.meshEngineHW = createMesh(gl, hm.d, hm.idx);
-    // Grid fins: titanium lattice, deployed (flow passes through the cells along the body axis).
-    const fins = [];
-    for (let k = 0; k < 4; k++) {
+    // Grid fins: titanium lattice (flow passes through the cells along the body
+    // axis when deployed).  One panel mesh, drawn four times: each panel turns
+    // about its radial shaft by its own deflection and folds up against the
+    // interstage when stowed (hinge fairings stay on the body).
+    const fairings = [];
+    {
       const parts = [];
       const x0 = 1.6, x1 = 2.85, y0 = -0.62, y1 = 0.62, zc = 16.8, dep = 0.32;
       parts.push(box(x1 - x0, 0.06, dep, (x0 + x1) / 2, y0, zc), box(x1 - x0, 0.06, dep, (x0 + x1) / 2, y1, zc));
@@ -323,11 +326,12 @@ export class Scene {
         const ang = Math.atan2(pb[1] - pa[1], pb[0] - pa[0]);
         parts.push(transformPart(box(L, 0.022, dep - 0.02, 0, 0, 0), M4.mul(M4.translate(mid), M4.rotAxis([0, 0, 1], ang))));
       }
-      parts.push(box(0.2, 0.3, 0.5, 1.5, 0, zc - 0.05));                  // hinge / actuator fairing
-      fins.push(transformPart(merge(parts), M4.rotAxis([0, 0, 1], (k * Math.PI) / 2)));
+      const fp = merge(parts);
+      this.meshFinPanel = createMesh(gl, fp.d, fp.idx);
     }
-    const fm = merge(fins);
-    this.meshFins = createMesh(gl, fm.d, fm.idx);
+    for (let k = 0; k < 4; k++) fairings.push(transformPart(box(0.2, 0.3, 0.5, 1.5, 0, 16.75), M4.rotAxis([0, 0, 1], (k * Math.PI) / 2)));
+    const fm = merge(fairings);
+    this.meshFins = createMesh(gl, fm.d, fm.idx);                             // hinge / actuator fairings
     // Landing leg: tapered carbon-fibre beam + foot pad oriented flat on the ground when deployed.
     const pad = transformPart(frustum(0.5, 0.42, -0.08, 0.1, 24), M4.mul(M4.translate([0.08, 0, 6.25]), M4.rotAxis([0, 1, 0], 35 * Math.PI / 180)));
     const leg = merge([taperedBox(0.95, 0.42, 0.42, 0.24, 6.2), transformPart(box(0.12, 0.7, 0.1, 0, 0, 0), M4.translate([0.12, 0, 0.3])), pad]);
@@ -536,6 +540,18 @@ export class Scene {
       [this.meshBody, 0, base], [this.meshFins, 3, base], [this.meshRcs, 1, base, [0.08, 0.08, 0.085]],
       [this.meshOuterBells, 10, base, null, 0], [this.meshEngineHW, 13, base, [0.14, 0.13, 0.12]],
     ];
+    // Grid-fin panels: fold (about the tangential hinge at the root) and
+    // deflection (about the radial shaft), from the simulated actuator state.
+    const fin = st.fins || { defl: [0, 0, 0, 0], deploy: 1 };
+    const fold = -(Math.PI / 2) * (1 - Math.max(0, Math.min(1, fin.deploy)));
+    const hingeIn = M4.translate([1.5, 0, 16.8]), hingeOut = M4.translate([-1.5, 0, -16.8]);
+    const shaftIn = M4.translate([0, 0, 16.8]), shaftOut = M4.translate([0, 0, -16.8]);
+    for (let k = 0; k < 4; k++) {
+      const d = (fin.defl[k] || 0) * Math.PI / 180;
+      const local = M4.mul(M4.mul(hingeIn, M4.mul(M4.rotAxis([0, 1, 0], fold), hingeOut)),
+        M4.mul(shaftIn, M4.mul(M4.rotAxis([1, 0, 0], d), shaftOut)));
+      parts.push([this.meshFinPanel, 3, M4.mul(base, M4.mul(M4.rotAxis([0, 0, 1], (k * Math.PI) / 2), local))]);
+    }
     const [gx, gy] = [st.gimbal[0] * Math.PI / 180, st.gimbal[1] * Math.PI / 180];
     const pivot = M4.translate([0, 0, 0.3]), unpivot = M4.translate([0, 0, -0.3]);
     const g = M4.mul(M4.rotAxis([0, 1, 0], gy), M4.rotAxis([1, 0, 0], gx));
