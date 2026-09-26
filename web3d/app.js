@@ -36,7 +36,7 @@ const buf = [];                 // [{t: arrival ms, st}]
 let latest = null;
 let online = true;
 const CLEAN = /[?&]clean/.test(location.search);
-const view = { flowMode: CLEAN ? 0 : 1, volField: 0, cam: 0, cfdCoef: null, cfdSps: 0, flowTime: 0 };
+const view = { flowMode: 0, volField: 1, cam: 0, cfdCoef: null, cfdSps: 0, flowTime: 0, showTraj: false };
 const CAM_NAMES = ["环绕", "着陆台", "侧视"];
 const VOL_NAMES = ["染料", "涡量", "速度"];
 const VOL_TO_TUNNEL = ["dye", "vort", "speed"];
@@ -134,6 +134,7 @@ window.addEventListener("keydown", (ev) => {
   else if (k === "c") act("cfd_forces");
   else if (k === "y") act("wind");
   else if (k === "f") { view.flowMode = 1 - view.flowMode; toast(view.flowMode ? "主视图气流：" + VOL_NAMES[view.volField] : "主视图气流已关闭，流场计算与风洞截面照常"); }
+  else if (k === "k") { view.showTraj = !view.showTraj; toast(view.showTraj ? "实际轨迹与预测轨迹：显示" : "实际轨迹与预测轨迹：隐藏"); }
   else if (k === "b") { view.volField = (view.volField + 1) % 3; hud.tunnel.setMode(VOL_TO_TUNNEL[view.volField]); toast("显示量：" + VOL_NAMES[view.volField]); }
   else if (k === "v") { view.cam = (view.cam + 1) % 3; toast("相机：" + CAM_NAMES[view.cam]); }
   else if (k === "l") { hud.resetLayout(); toast("仪表布局与窗口大小已恢复默认"); }
@@ -477,8 +478,8 @@ function frame(now) {
     const camDist = (p) => V.len(V.sub(p, eye));
     const pxW = (p) => Math.max(0.05, camDist(p) * 0.0022);   // ~constant screen width
     // Actual trajectory (blue) and G-FOLD plan (green).
-    if (!CLEAN && view.flowMode === 0 && st.trail && st.trail.length > 1) ribbon(st.trail.concat([st.pos]), pxW, [0.3, 0.65, 1.0, 0.75], eye);
-    if (!CLEAN && view.flowMode === 0 && st.plan && st.plan.length > 1) ribbon(st.plan, (p) => pxW(p) * 1.2, [0.35, 1.0, 0.6, 0.85], eye);
+    if (!CLEAN && view.showTraj && view.flowMode === 0 && st.trail && st.trail.length > 1) ribbon(st.trail.concat([st.pos]), pxW, [0.3, 0.65, 1.0, 0.75], eye);
+    if (!CLEAN && view.showTraj && view.flowMode === 0 && st.plan && st.plan.length > 1) ribbon(st.plan, (p) => pxW(p) * 1.2, [0.35, 1.0, 0.6, 0.85], eye);
     scene.time = now / 1000;
     const stR = Object.assign({}, st, { wind: st.wind || [0, 0, 0] });
     const fx = { rcs: rcsJets(st), lines: lineBuf.subarray(0, lineN * 8), particles: (rocketAxis = [V.add(st.pos, rot(st.q, [0, 0, -2])), rot(st.q, [0, 0, 1])], buildParticles(cam.eye, plumeNow)), plume: plumeNow };

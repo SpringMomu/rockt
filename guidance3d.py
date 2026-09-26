@@ -782,6 +782,7 @@ class Autopilot3D:
             c.throttle = 0.0
             c.rcs = (0.0, 0.0, 0.0)
             c.gimbal = (0.0, 0.0)
+            c.fins = (0.0, 0.0, 0.0)
             self.phase = "LANDED" if veh.state == "LANDED" else "STANDBY"
             self._mark()
             return

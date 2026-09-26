@@ -13,6 +13,90 @@ function fmt(x, d = 1) { return x === null || x === undefined || !isFinite(x) ? 
 function kN(n) { return Math.abs(n) >= 1e5 ? (n / 1000).toFixed(0) + " kN" : (n / 1000).toFixed(1) + " kN"; }
 function setLamp(el, cls) { el.className = "lamp" + (cls ? " " + cls : ""); }
 
+// Engine and grid-fin status, SpaceX webcast style: thin white line art on
+// black, the 9-engine octaweb seen from below (lit = burning; the centre
+// engine gimbals) and the four grid fins seen from above (actual deflection).
+function drawPropulsion(cv, st) {
+  const g = cv.getContext("2d");
+  const W = cv.width, H = cv.height, S = W / 320;
+  g.setTransform(S, 0, 0, S, 0, 0);
+  g.clearRect(0, 0, 320, 200);
+  const white = "rgba(255,255,255,0.92)", dim = "rgba(255,255,255,0.35)", faint = "rgba(255,255,255,0.14)";
+  const font = (px, w = 400) => `${w} ${px}px "Helvetica Neue", "Segoe UI", Arial, "Microsoft YaHei", sans-serif`;
+  const burning = st.throttle > 0.01 && st.state === "FLYING";
+  const thr = Math.max(0, Math.min(1, st.throttle || 0));
+
+  // ---- engines (octaweb from below)
+  const cx = 78, cy = 92, R = 58;
+  g.lineWidth = 1.2; g.strokeStyle = faint;
+  g.beginPath(); g.arc(cx, cy, R, 0, 2 * Math.PI); g.stroke();
+  const eng = (x, y, r, on, level) => {
+    g.beginPath(); g.arc(x, y, r, 0, 2 * Math.PI);
+    if (on) {
+      g.save(); g.shadowColor = "rgba(255,255,255,0.9)"; g.shadowBlur = 6 + 14 * level;
+      g.fillStyle = white; g.fill(); g.restore();
+    } else { g.strokeStyle = dim; g.lineWidth = 1.4; g.stroke(); }
+  };
+  for (let k = 0; k < 8; k++) {
+    const a = (k / 8) * 2 * Math.PI + Math.PI / 8;
+    eng(cx + Math.cos(a) * R * 0.66, cy + Math.sin(a) * R * 0.66, 11, false, 0);
+  }
+  const lim = st.gimbal_limit || 8;
+  const gx = (st.gimbal[1] || 0) / lim, gy = -(st.gimbal[0] || 0) / lim;   // nozzle offset, full scale = limit
+  g.strokeStyle = faint; g.lineWidth = 1;
+  g.beginPath(); g.arc(cx, cy, 15, 0, 2 * Math.PI); g.stroke();              // gimbal range
+  eng(cx + 5 * gx, cy + 5 * gy, 11, burning, thr);
+  g.fillStyle = white; g.font = font(10, 500); g.textAlign = "center";
+  g.fillText("MERLIN 1D", cx, cy + R + 16);
+  g.fillStyle = dim; g.font = font(9);
+  g.fillText(burning ? "1 OF 9 ACTIVE" : "ENGINES OFF", cx, cy + R + 29);
+
+  // throttle bar
+  const bx = 150, by = 34, bh = 118;
+  g.strokeStyle = dim; g.lineWidth = 1; g.strokeRect(bx, by, 8, bh);
+  g.fillStyle = white; g.fillRect(bx + 1.5, by + bh - (bh - 3) * thr - 1.5, 5, (bh - 3) * thr);
+  g.fillStyle = dim; g.font = font(8); g.textAlign = "center";
+  g.fillText("THR", bx + 4, by - 6);
+  g.fillStyle = white; g.font = font(11, 500);
+  g.fillText(Math.round(thr * 100) + "%", bx + 4, by + bh + 16);
+
+  // ---- grid fins (from above)
+  const fx = 248, fy = 90, r0 = 13;
+  const fins = st.fins || { defl: [0, 0, 0, 0], deploy: 1 };
+  const dep = Math.max(0, Math.min(1, fins.deploy));
+  const on = dep > 0.98;
+  g.strokeStyle = dim; g.lineWidth = 1.4;
+  g.beginPath(); g.arc(fx, fy, r0, 0, 2 * Math.PI); g.stroke();
+  for (let k = 0; k < 4; k++) {
+    const az = (k * Math.PI) / 2;
+    const d = (fins.defl[k] || 0) * Math.PI / 180;
+    const L = 6 + 18 * dep, Wd = 16;
+    g.save();
+    g.translate(fx + Math.cos(-az) * (r0 + 3), fy + Math.sin(-az) * (r0 + 3));
+    g.rotate(-az);
+    // panel turned by 3x its deflection so that small angles are visible
+    g.translate(L / 2, 0); g.rotate(3 * d * dep); g.translate(-L / 2, 0);
+    g.beginPath(); g.rect(0, -Wd / 2, L, Wd);
+    g.save(); g.clip();
+    g.strokeStyle = on ? "rgba(255,255,255,0.45)" : faint; g.lineWidth = 0.8;
+    g.beginPath();
+    for (let t = -Wd; t < L + Wd; t += 4) { g.moveTo(t, -Wd / 2); g.lineTo(t + Wd, Wd / 2); g.moveTo(t, Wd / 2); g.lineTo(t + Wd, -Wd / 2); }
+    g.stroke(); g.restore();
+    g.strokeStyle = on ? white : dim; g.lineWidth = 1.3;
+    g.strokeRect(0, -Wd / 2, L, Wd);
+    g.restore();
+    const val = fins.defl[k] || 0;
+    const rl = k % 2 === 0 ? 60 : 48;
+    const tx = fx + Math.cos(-az) * rl, ty = fy + Math.sin(-az) * rl + 3.5;
+    g.fillStyle = on ? white : dim; g.font = font(9.5, 500); g.textAlign = "center";
+    g.fillText((val >= 0 ? "+" : "") + val.toFixed(1) + "°", tx, ty);
+  }
+  g.fillStyle = white; g.font = font(10, 500); g.textAlign = "center";
+  g.fillText("GRID FINS", fx, 176);
+  g.fillStyle = dim; g.font = font(9);
+  g.fillText(dep < 0.02 ? "STOWED" : dep < 0.98 ? `DEPLOYING ${Math.round(dep * 100)}%` : "DEPLOYED", fx, 189);
+}
+
 export class HUD {
   constructor() {
     this.fdai = new FDAI($("navball"));
@@ -100,6 +184,14 @@ export class HUD {
   // ------------------------------------------------------------------ update
   update(st, view) {
     if (!st) return;
+    const propCv = document.getElementById("propCv");
+    if (propCv) {
+      drawPropulsion(propCv, st);
+      const burning = st.throttle > 0.01 && st.state === "FLYING";
+      const tag = document.getElementById("propTag");
+      const txt = st.state === "LANDED" ? "LANDED" : burning ? (st.phase === "BOOSTBACK" ? "BOOSTBACK BURN" : st.phase === "LANDING BURN" ? "LANDING BURN" : "ENGINE ON") : st.state === "FLYING" ? "COAST" : "STANDBY";
+      if (tag.textContent !== txt) tag.textContent = txt;
+    }
     const phase = st.phase;
     // Top strip.
     const m = Math.floor(st.t / 60), s = st.t - 60 * m;

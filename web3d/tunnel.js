@@ -40,14 +40,14 @@ export class TunnelView {
   constructor({ canvas, wrap, modeBar, planeBar, partBtn, forceBtn, foot, tag }) {
     this.cv = canvas; this.ctx = canvas.getContext("2d");
     this.wrap = wrap; this.foot = foot; this.tag = tag;
-    this.mode = "dye"; this.plane = "EU"; this.particles = true; this.forces = true;
+    this.mode = "vort"; this.plane = "EU"; this.particles = true; this.forces = true;
     this.zoom = 1;
     this.vis = null;                 // auto colour scales (smoothed, as in fluid.c)
     this.slice = null; this.img = null; this.off = document.createElement("canvas");
     this.parts = []; this.lastFlowT = null;
     this.error = null;
     try {
-      const s = JSON.parse(localStorage.getItem("booster3d.tunnel.v2") || "{}");
+      const s = JSON.parse(localStorage.getItem("booster3d.tunnel.v3") || "{}");
       if (TUNNEL_MODES.includes(s.mode)) this.mode = s.mode;
       if (PLANES[s.plane]) this.plane = s.plane;
       if (typeof s.particles === "boolean") this.particles = s.particles;
@@ -102,7 +102,7 @@ export class TunnelView {
   }
 
   setMode(m) { if (TUNNEL_MODES.includes(m)) { this.mode = m; this._save(); this._sync(); this.imgStale = true; } }
-  _save() { try { localStorage.setItem("booster3d.tunnel.v2", JSON.stringify({ mode: this.mode, plane: this.plane, particles: this.particles, forces: this.forces })); } catch (e) { /* ignore */ } }
+  _save() { try { localStorage.setItem("booster3d.tunnel.v3", JSON.stringify({ mode: this.mode, plane: this.plane, particles: this.particles, forces: this.forces })); } catch (e) { /* ignore */ } }
   _sync() {
     for (const [m, b] of Object.entries(this.modeBtns)) b.classList.toggle("on", m === this.mode);
     for (const [k, b] of Object.entries(this.planeBtns)) b.classList.toggle("on", k === this.plane);

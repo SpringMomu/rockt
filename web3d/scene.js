@@ -820,6 +820,7 @@ export class Scene {
     gl.uniform1f(pp.u.u_wall, P.hit ? P.heat * P.intensity : 0);
     gl.uniform1f(pp.u.u_blast, P.blast);
     gl.uniform3fv(pp.u.u_hit, P.hit || [0, 0, -1e4]);
+    if (pp.u.u_gg) gl.uniform3fv(pp.u.u_gg, P.gg || P.exit);
     gl.uniform1f(pp.u.u_dscale, T.W / T.PW);
     this._fullscreen();
     gl.disable(gl.SCISSOR_TEST);

@@ -61,8 +61,12 @@ export function plumeParams(st, time = 0) {
   }
   const Rw = Rj * 1.6 + 14 * heat + 3 * blast;
   const flick = 0.94 + 0.06 * Math.sin(time * 61.0) * Math.sin(time * 23.7 + 1.3);
+  // Merlin gas-generator (turbopump) exhaust: a separate fuel-rich, sooty
+  // stream dumped beside the engine -- the dark smoke trail seen next to a
+  // Falcon 9 plume.
+  const gg = V.add(st.pos, rot(q, [0.62, 0.0, -1.3]));
   return {
-    on, thr, axis, exit, pamb, len, spread, bulge, bend, jetR, hdist, hit, Rj, Rw, heat, blast,
+    on, thr, axis, exit, gg, pamb, len, spread, bulge, bend, jetR, hdist, hit, Rj, Rw, heat, blast,
     intensity: on ? (0.35 + 0.65 * thr) * flick : 0,
     diamonds: Math.pow(pamb, 2.0) * (0.55 + 0.45 * thr),
     lambda: 1.3 * 2 * EXIT_R * Math.pow(1 / Math.max(0.05, pamb), 0.35),

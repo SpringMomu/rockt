@@ -136,6 +136,13 @@ html, body { margin: 0; height: 100%; background: #04070c; color: var(--txt); fo
 #hint b { color: var(--cyan); }
 #err { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; font-size: 16px; color: var(--amber); background: #04070c; text-align: center; padding: 40px; }
 kbd { font-family: var(--mono); background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.18); border-bottom-width: 2px; border-radius: 3px; padding: 0 4px; font-size: 10.5px; color: var(--txt); }
+/* engine & grid-fin status (SpaceX webcast style) */
+#propPanel { left: 270px; top: 80px; width: 320px; padding: 0; background: rgba(0,0,0,0.62);
+  border: 1px solid rgba(255,255,255,0.14); border-radius: 4px; backdrop-filter: blur(4px); }
+#propPanel h3 { margin: 0; padding: 5px 12px; background: none; border-bottom: 1px solid rgba(255,255,255,0.10);
+  color: rgba(255,255,255,0.72); font-weight: 400; letter-spacing: 0.32em; font-size: 10px; }
+#propPanel h3 .tag { color: rgba(255,255,255,0.9); letter-spacing: 0.2em; }
+#propCv { width: 320px; height: 200px; display: block; }
 @media (max-width: 1100px) { #events { display: none; } }
 </style>
 </head>
@@ -224,10 +231,12 @@ kbd { font-family: var(--mono); background: rgba(255,255,255,0.08); border: 1px 
   <canvas id="scopeCv" width="520" height="580"></canvas>
 </div>
 
+<div id="propPanel" class="panel"><h3>ENGINE · GRID FINS <span class="tag" id="propTag">STANDBY</span></h3><canvas id="propCv" width="640" height="400"></canvas></div>
+
 <div id="events" class="panel"><h3>事件记录 <span class="tag" id="warp">1×</span></h3><div id="evList"></div></div>
 
 <div id="banner"></div>
-<div id="hint"><b>H</b> 帮助 · <b>M</b> 自动驾驶 · <b>F</b> 主视图气流 · <b>V</b> 相机 · <b>1-9 0</b> 场景</div>
+<div id="hint"><b>H</b> 帮助 · <b>M</b> 自动驾驶 · <b>F</b> 主视图气流 · <b>K</b> 轨迹 · <b>V</b> 相机 · <b>1-9 0</b> 场景</div>
 
 <div id="help" class="panel">
   <h3>操作说明 <span class="tag">KSP 键位</span></h3>
@@ -243,6 +252,7 @@ kbd { font-family: var(--mono); background: rgba(255,255,255,0.08); border: 1px 
     <tr><td><kbd>7</kbd> <kbd>8</kbd> <kbd>9</kbd> <kbd>0</kbd></td><td>返场全流程（一级分离 → 翻转反推返航 → 滑行过顶点再入 → 着陆点火）：30 km 分离 / 35 km 分离 + 强侧风 / 30 km 分离 + 推进剂仅 3 t / 40 km 分离 + 阵风 + 初始翻滚</td></tr>
     <tr><td><kbd>Backspace</kbd></td><td>回到发射台，手动起飞</td></tr>
     <tr><td><kbd>F</kbd></td><td>主视图三维气流显示开 / 关（关闭后流场照常计算，风洞截面照常显示）</td></tr>
+    <tr><td><kbd>K</kbd></td><td>实际轨迹（蓝）与预测轨迹（绿）显示 / 隐藏（默认隐藏）</td></tr>
     <tr><td><kbd>B</kbd></td><td>切换显示量：染料 / 涡量 / 速度（主视图与风洞截面同步）</td></tr>
     <tr><td><kbd>C</kbd></td><td>作用在箭体上的气动力：工程模型 ↔ 实时 3D CFD（在工程模型 0.5–2 倍范围内采信）</td></tr>
     <tr><td><kbd>Y</kbd></td><td>风场开 / 关</td></tr>

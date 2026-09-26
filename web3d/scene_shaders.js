@@ -362,14 +362,17 @@ uniform vec3 u_exit, u_axis, u_bend;
 uniform float u_len, u_re, u_spread, u_bulge, u_time, u_I, u_dia, u_lambda, u_pamb;
 uniform float u_hdist, u_Rj, u_Rw, u_wall, u_blast;
 uniform vec3 u_hit; uniform float u_dscale;
+uniform vec3 u_gg;
 ${NOISE3}
 float jetR(float s) { return u_re * (1.0 + u_bulge * (1.0 - exp(-s / (4.0 * u_re)))) + max(s, 0.0) * u_spread; }
 // Emission (rgb) and extinction (a) of the free jet at p.
 // Luminous RP-1/LOX flame colour: incandescent soot, white-yellow when hottest.
+// Merlin (RP-1/LOX, fuel-rich): a white-hot core at the nozzle, a bright
+// yellow-orange body, deep orange at the ragged edge -- not red.
 vec3 flameColor(float h) {
-  vec3 c = mix(vec3(0.42, 0.07, 0.01), vec3(1.0, 0.36, 0.05), smoothstep(0.0, 0.3, h));
-  c = mix(c, vec3(1.0, 0.66, 0.22), smoothstep(0.25, 0.6, h));
-  c = mix(c, vec3(1.0, 0.90, 0.66), smoothstep(0.55, 0.95, h));
+  vec3 c = mix(vec3(0.70, 0.20, 0.03), vec3(1.0, 0.48, 0.08), smoothstep(0.0, 0.3, h));
+  c = mix(c, vec3(1.0, 0.74, 0.28), smoothstep(0.25, 0.6, h));
+  c = mix(c, vec3(1.0, 0.95, 0.84), smoothstep(0.55, 0.95, h));
   return c;
 }
 vec4 freeJet(vec3 p) {
@@ -400,8 +403,31 @@ vec4 freeJet(vec3 p) {
   float gcut = smoothstep(0.0, 0.3 * u_Rj + 0.3, p.z);
   float after = 0.3 + 0.7 * u_pamb;
   float h = clamp(heat * 0.72 + core * 0.7 + shock * 0.5, 0.0, 1.0);
-  vec3 em = (flameColor(h) * heat * after * 13.0 + flameColor(0.8 + 0.2 * core) * (core * 24.0 + shock * 30.0)) * u_I * gcut;
+  // Bright, almost white first metres of the jet (the Merlin "flame cone").
+  float cone = smoothstep(u_re * 1.6, u_re * 0.4, r) * exp(-max(s, 0.0) / (1.5 + 0.12 * u_len)) * start;
+  h = clamp(h + cone * 0.5, 0.0, 1.0);
+  vec3 em = (flameColor(h) * heat * after * 13.0 + flameColor(0.8 + 0.2 * core) * (core * 24.0 + shock * 30.0)
+             + vec3(1.0, 0.93, 0.8) * cone * 30.0) * u_I * gcut;
   float ext = (heat * 1.8 + core * 1.5) * u_I * gcut;
+  // Soot: RP-1 burns fuel-rich; in dense air the turbulent outer shear layer
+  // carries dark smoke streaks that grow downstream (dark, not luminous).
+  float sootN = fbm3l(qb * 0.9 - u_axis * u_time * 20.0 + 7.0);
+  float shell = smoothstep(0.6, 0.9, rn) * smoothstep(1.2, 0.95, rn);
+  float soot = shell * smoothstep(0.25, 0.8, sn) * smoothstep(0.55, 0.75, sootN) * u_pamb * start;
+  em *= 1.0 - 0.3 * soot;
+  ext += soot * 0.45 * u_I * gcut;
+  // Gas-generator exhaust beside the engine: a thin, dark, lazily burning stream.
+  vec3 qg = p - u_gg;
+  float sg = dot(qg, u_axis);
+  if (sg > -0.2 && sg < u_len * 0.9) {
+    float rg = length(qg - u_axis * sg);
+    float Rg = 0.14 + 0.07 * max(sg, 0.0);
+    float gn = fbm3l(qg * 1.6 - u_axis * u_time * 16.0 + 3.0);
+    float gd = smoothstep(Rg * (1.2 + 0.6 * gn), Rg * 0.3, rg) * smoothstep(-0.2, 0.3, sg) * smoothstep(u_len * 0.9, u_len * 0.3, sg);
+    float glow = exp(-max(sg, 0.0) / 2.5);
+    em += vec3(1.0, 0.42, 0.08) * gd * glow * 5.0 * u_I * gcut;
+    ext += gd * (0.5 + 1.2 * u_pamb) * (0.4 + 0.6 * gn) * u_I * gcut;
+  }
   return vec4(em, ext);
 }
 // Flame turned by the pad: a flat turbulent fire sheet spreading radially.
